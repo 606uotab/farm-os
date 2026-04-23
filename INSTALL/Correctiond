@@ -1,0 +1,468 @@
+# Journal de corrections farm-os
+
+Notes personnelles accumulées en suivant `BASE.md` et `APPLICATIVES.md` du repo [606uotab/farm-os](https://github.com/606uotab/farm-os).
+
+Classé par phase. Chaque entrée : **problème rencontré → correction appliquée → commentaire / idée**.
+
+---
+
+## Phase 01 — Hôte Void Linux
+
+### Intel UHD 630 — Sway tente de rendre sur card1
+
+**Problème :** au premier `sway`, écran noir / crash. Logs mentionnent `card1` alors que le GPU intégré est sur `card0`.
+
+**Correction :**
+```sh
+export WLR_DRM_DEVICES=/dev/dri/card0
+```
+Ajouté à `~/.zshrc` ou en one-shot avant `sway`.
+
+**Commentaire :** la doc ne mentionne pas ce cas, mais c'est fréquent sur laptops Intel avec IGP unique. À ajouter en note dans phase 01.
+
+---
+
+### Abandon de Sway pour Fluxbox
+
+**Problème :** courbe d'apprentissage Sway + waybar + fenêtres tiling-only gênante pour admin au quotidien.
+
+**Correction :** bascule sur Fluxbox + Xorg. Install :
+```sh
+sudo xbps-install -Su fluxbox xorg-minimal xinit feh xterm xorg-apps
+echo 'setxkbmap fr' > ~/.xinitrc
+echo 'exec ~/.fluxbox/startup' >> ~/.xinitrc
+```
+
+**Commentaire :** la doc recommande Sway ou i3. Fluxbox est une déviation personnelle assumée. i3 aurait été plus cohérent avec le reste (keybinds tiling, même esprit que Sway).
+
+---
+
+### Menu Fluxbox sans entrées utiles par défaut
+
+**Problème :** le menu généré automatiquement pointe vers des apps non installées (firefox, gimp, etc.). Virt-manager absent.
+
+**Correction :**
+```sh
+fluxbox-generate_menu -o ~/.fluxbox/menu
+# puis édition manuelle pour ajouter virt-manager
+sed -i '/firefox/a [exec] (Virt-Manager) {virt-manager}' ~/.fluxbox/menu
+```
+Ctrl+Shift+R pour recharger.
+
+**Commentaire :** pour un vrai launcher, envisager `tint2` ou `rofi` en complément. La slit peut recevoir des dockapps mais ce sont des widgets, pas des lanceurs.
+
+---
+
+### Dockapps dans la slit — noms Void spécifiques
+
+**Problème :** `wmclockmon`, `wmnet`, `wmcpuload`, `wmbattery` n'existent pas dans les repos Void.
+
+**Correction :** utiliser les noms réels Void :
+```sh
+sudo xbps-install -Su wmclock wmbatteries wmbubble wmix wmsystemtray
+```
+- `wmclock` (pas `wmclockmon`)
+- `wmbatteries` (pas `wmbattery`)
+- `wmbubble` (couvre CPU + RAM + net en un seul widget)
+- Pas de `wmnet` ou `wmnd` simples sur Void, `wmbubble` compense
+- `wmix` pour le mixer audio
+- `wmsystemtray` pour recevoir les icônes d'apps
+
+**Commentaire :** idée — faire un script `install-dockapps.sh` qui teste `xbps-query -Rs` avant d'installer, pour s'adapter aux renommages futurs.
+
+---
+
+### `~/.fluxbox/startup` absent par défaut
+
+**Problème :** le fichier n'existe pas après install Fluxbox, il doit être créé à la main.
+
+**Correction :**
+```sh
+cat > ~/.fluxbox/startup <<'EOF'
+#!/bin/sh
+wmclock &
+wmbatteries &
+wmbubble &
+wmix &
+wmsystemtray &
+exec fluxbox
+EOF
+chmod +x ~/.fluxbox/startup
+```
+Et `~/.xinitrc` doit appeler `~/.fluxbox/startup`, pas `fluxbox` directement.
+
+---
+
+### Réseau libvirt `default` absent sur Void
+
+**Problème :** Void ne crée pas automatiquement le réseau libvirt `default`. `virsh net-list --all` ne le liste même pas.
+
+**Correction :** créer manuellement avec XML minimal, puis définir + activer + autostart.
+
+**Commentaire :** la doc BASE.md assume implicitement que `default` existe déjà (comme sur Debian/Fedora). À ajouter explicitement dans phase 01 pour utilisateurs Void.
+
+---
+
+### Backend firewall libvirt
+
+**Problème :** sans `nftables` explicitement comme backend, libvirt essaie iptables qui n'est pas installé par défaut sur Void → NAT ne marche pas pour les VMs.
+
+**Correction :**
+```sh
+sudo xbps-install -y nftables
+sudoedit /etc/libvirt/network.conf
+# décommenter/ajouter :
+# firewall_backend = "nftables"
+sudo sv restart libvirtd
+```
+
+**Commentaire :** la doc devrait mentionner ce point pour Void. Sur Debian/Fedora c'est géré automatiquement.
+
+---
+
+### `LIBVIRT_DEFAULT_URI` nécessaire sur Void
+
+**Problème :** sans cette variable, `virsh` attaque `qemu:///session` (par user, pas de VMs système).
+
+**Correction :**
+```sh
+echo 'export LIBVIRT_DEFAULT_URI="qemu:///system"' >> ~/.zshrc
+```
+User `gaia` doit être dans le groupe `libvirt`.
+
+---
+
+### Autostart X au login TTY1 non fonctionnel
+
+**Problème :** `~/.zlogin` avec `exec startx` ne déclenche pas au login TTY1 sur zsh + runit.
+
+**Correction :** **non résolu**, reste à debug. Workaround : lancer `startx` manuellement après login.
+
+**Commentaire à creuser :** probablement un conflit entre zsh login modes et la détection `$DISPLAY`. À explorer côté `~/.zprofile` ou `/etc/zsh/zprofile`.
+
+---
+
+## Phase 02 — VM atelier (Debian)
+
+### DHCP ne marche pas au premier boot VM
+
+**Problème :** l'installer Debian n'attribue pas d'IP. Le tap `vnet*` côté Void est en état `DOWN`.
+
+**Correction :**
+```sh
+sudo ip link set vnet1 up   # remplacer vnet1 par le nom réel
+```
+
+**Commentaire :** bug de timing libvirt/runit sur Void. À creuser pour savoir si c'est un hook manquant ou un ordre de services au boot.
+
+---
+
+### Trou dans la doc : comment sortir du shell rescue Debian installer
+
+**Problème :** doc ne précise pas qu'une fois dans le shell busybox de secours, `ip -br link` et `dhclient` n'existent pas.
+
+**Correction / note :** utiliser :
+- `ip link` (sans `-br`)
+- `udhcpc -i enp1s0` (pas `dhclient`)
+- `ls /sys/class/net/` pour connaître le nom exact des interfaces
+
+---
+
+### Doc silencieuse sur la sortie du shell BusyBox
+
+**Problème :** quand on tape `dhclient` et que ça échoue, pas évident de savoir qu'on doit revenir à l'installer via le menu principal.
+
+**Commentaire :** à ajouter dans BASE.md : « Si DHCP échoue, taper `exit` pour revenir au menu installer → Configurer le réseau → Retry ».
+
+---
+
+## Phase 03 — VM obsd-router (install OpenBSD)
+
+### OpenBSD installer — pas de clavier dans la console virt-manager
+
+**Problème :** clic dans la fenêtre, aucune touche ne répond, impossible de taper `i` pour installer.
+
+**Correction :** ajouter un clavier PS/2 explicitement dans l'XML via virt-manager → Add Hardware → Input → Keyboard PS/2. Ou basculer chipset Q35 → i440fx.
+
+**Commentaire :** la doc ne précise pas la config VM optimale pour OpenBSD. Intégrer dans phase 03 les specs recommandées :
+- Chipset : i440fx (plus simple, pas de souci USB xHCI)
+- Bus disque : VirtIO
+- NIC : virtio
+- Clavier : PS/2 explicite
+
+---
+
+### Nommage VM incohérent avec la doc
+
+**Problème :** la doc parle d'`obsd-router` partout, mais j'ai créé la VM avec `router`. Toutes les commandes `virsh snapshot-create-as obsd-router` échouent.
+
+**Correction :** renommer :
+```sh
+sudo virsh domrename router obsd-router
+```
+(VM doit être éteinte.)
+
+**Commentaire :** à suivre la nomenclature de la doc dès le début. Ou alors noter quelque part « ma VM s'appelle X dans mon setup ».
+
+---
+
+### Doc ne mentionne pas le paquet `snap` inexistant
+
+**Problème :** la doc fait :
+```sh
+pkg_add -D snap vim-no_x11 curl git rsync wireguard-tools
+```
+Le `-D snap` est un flag de debug pour snapshots OpenBSD-current, pas un paquet. Confus pour un débutant.
+
+**Correction :** sur release stable (7.8), remplacer par :
+```sh
+pkg_add vim-no_x11 curl git rsync wireguard-tools
+```
+
+**Commentaire :** à clarifier dans la doc — `-D snap` utile seulement si on suit -current.
+
+---
+
+### Pas d'interface graphique sur obsd-router = copier-coller impossible
+
+**Problème :** pas de SPICE agent dans OpenBSD → clipboard ne passe pas depuis Void vers la console virt-manager d'obsd-router.
+
+**Correction / workaround :** une fois SSH configuré depuis atelier, tout se fait en SSH où le clipboard fonctionne via xterm. Pendant phase 04 (avant SSH), deux options :
+1. Taper à la main (long)
+2. Héberger temporairement le fichier en HTTP sur Void et `ftp -o` depuis OpenBSD
+
+**Commentaire :** la doc devrait recommander la méthode HTTP transitoire pour pf.conf, unbound.conf, dhcpd.conf.
+
+---
+
+### Trou dans la doc : relancer la VM après arrêt propre
+
+**Problème :** la doc dit « Arrêt propre de la VM » pour snapshot, puis « Vérifications finales ». Mais ne dit jamais **comment redémarrer**.
+
+**Correction :** à ajouter :
+```sh
+sudo virsh start obsd-router
+sleep 10
+sudo virsh list       # vérifier "en cours d'exécution"
+```
+
+---
+
+### Console virt-manager vs SSH — prompt identique, confusion
+
+**Problème :** mon prompt ksh OpenBSD s'appelle `router$` dans les deux cas. Difficile de savoir si on est dans la console virt-manager ou dans un SSH depuis atelier.
+
+**Correction / bonne pratique :** vérifier via `hostname` et/ou le titre de la fenêtre xterm/virt-manager. Configurer le PS1 différemment sur SSH (via `~/.kshrc`) pour distinguer visuellement.
+
+---
+
+## Phase 04 — Bridges, routage, pf, dhcpd, unbound
+
+### pf.conf — erreur classique `random-if` au lieu de `random-id`
+
+**Problème :** erreur de frappe dans `match in all scrub (no-df random-if max-mss 1440)`. `random-if` n'existe pas.
+
+**Correction :**
+```
+match in all scrub (no-df random-id max-mss 1440)
+```
+
+**Commentaire :** la doc devrait aussi proposer le fichier pf.conf téléchargeable depuis le repo GitHub. Éviterait les fautes de frappe.
+
+---
+
+### unbound.conf — ordre des sections obligatoire
+
+**Problème :** toutes les directives `interface`, `access-control` etc. doivent être **sous une section `server:`**. Le template OpenBSD par défaut en a une, mais si on efface tout pour coller la config farm-os, on oublie `server:` en ligne 1.
+
+**Correction :** structure correcte :
+```
+server:
+    interface: 127.0.0.1
+    ...
+    tls-cert-bundle: "/etc/ssl/cert.pem"
+    verbosity: 1
+
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+    forward-addr: 9.9.9.9@853#dns.quad9.net
+```
+
+---
+
+### unbound.conf — `interface` nécessite `:` comme toutes les directives
+
+**Problème :** facile à oublier. Les `access-control:`, `hide-identity:` ont bien leur `:`, mais on peut louper celui d'`interface`.
+
+**Correction :** `interface: 127.0.0.1` (pas `interface 127.0.0.1`).
+
+---
+
+### unbound.conf — `agressive-nsec` vs `aggressive-nsec`
+
+**Problème :** faute d'orthographe française (un seul g). Unbound rejette.
+
+**Correction :** `aggressive-nsec: yes` (double g, orthographe anglaise).
+
+---
+
+### unbound — TLS handshake échoue : CA bundle manquant
+
+**Problème :** `ssl handshake failed: unable to get local issuer certificate` sur tous les forwards DoT vers Quad9. Unbound n'a pas les certificats CA racine.
+
+**Correction :** ajouter dans la section `server:` :
+```
+tls-cert-bundle: "/etc/ssl/cert.pem"
+```
+
+**Commentaire :** **trou majeur dans la doc.** Sans cette ligne, le DoT ne fonctionne pas. À ajouter impérativement dans phase 04.H.
+
+---
+
+### Perte de SSH depuis atelier vers obsd-router pendant phase 04
+
+**Problème :** après reconfiguration des NICs d'obsd-router (passage sur br-wan/br-vpn/br-direct), atelier et router ne sont plus sur le même réseau. SSH perdu jusqu'à migration atelier sur br-vpn (phase 04.J).
+
+**Correction :** accepter de travailler via la console virt-manager pendant toute la phase 04 jusqu'à J. Ou migrer atelier sur br-vpn plus tôt (en static) si on veut SSH plus vite.
+
+**Commentaire :** à mentionner dans phase 04.C — prévenir l'utilisateur que SSH est coupé jusqu'à J.
+
+---
+
+## Idées et réflexions d'architecture
+
+### SSH segregation policy
+
+Principe : atelier ne devrait SSH qu'aux composants d'infra (voidhv, obsd-\*), pas aux VMs applicatives.
+
+Liste « atelier SSH autorisé » :
+- voidhv (hyperviseur)
+- obsd-router (routeur principal)
+- obsd-torgw (tor-gw)
+- obsd-i2pgw (i2p-gw)
+- bitcoin-node (headless, pas le choix)
+
+Liste « atelier SSH interdit » :
+- routine, dev, banque, sparrow, windows11, Whonix-GW/WS, anon-browse
+
+Justification : réduire le blast radius si atelier est compromise. Les VMs applicatives sont utilisées via leur console graphique virt-manager ou leur client dédié (RDP, GUI Spice).
+
+---
+
+### Une clé SSH par destination
+
+Au lieu d'une clé passe-partout `farm_os_admin`, générer :
+- `farm_os_voidhv`
+- `farm_os_obsd`
+- `farm_os_torgw`
+- `farm_os_i2pgw`
+- `farm_os_bitcoin`
+
+Chaque `authorized_keys` ne contient que la clé dédiée. Compromission d'une clé = compromission d'une cible seulement.
+
+---
+
+### Migration future vers YubiKey (Nitrokey en version RYF)
+
+- 2 YubiKey (Admin + Spare) dans deux emplacements physiques distincts
+- Clés SSH FIDO2 résidentes : `ssh-keygen -t ed25519-sk -O resident`
+- Clé GPG sur YubiKey pour sécuriser `pass`
+- Clé SSH de recovery en fichier chiffré GPG sur cloud (Proton Drive) pour scénario catastrophe en voyage
+
+**Setup avant premier voyage long :**
+1. Générer les 2 YubiKey avec les mêmes credentials (possible au moment de la génération)
+2. Dépôt de `authorized_keys` Admin + Spare + recovery sur toutes les cibles critiques
+3. Test de la procédure recovery (simuler perte de Admin, restaurer depuis Spare)
+4. Documenter la procédure dans `RECOVERY.md`
+
+---
+
+### Backup régulier du qcow2 obsd-router
+
+obsd-router = point névralgique. Si son qcow2 meurt, tout tombe.
+
+Automatiser :
+```sh
+# Weekly sur voidhv
+sudo virsh snapshot-create-as obsd-router "weekly-$(date +%Y%m%d)"
+rsync -av /var/lib/libvirt/images/obsd-router.qcow2 \
+      /mnt/backup-external/farm-os/
+```
+
+Cible : disque USB chiffré LUKS dans un tiroir, ou NAS chiffré.
+
+---
+
+### Fichier RECOVERY.md à créer
+
+Procédure de récupération complète pour :
+- Corruption obsd-router (restore snapshot → restore qcow2 backup → rebuild from scratch)
+- Perte clé SSH Admin en voyage
+- Corruption voidhv (reinstall Void → restore qcow2 chiffrés depuis backup)
+- Perte complète (incendie, vol voidhv) — hors scope mais à documenter
+
+---
+
+### Atelier doit rester sans secrets critiques
+
+Règle stricte à écrire dans la doc farm-os :
+- Pas de `pass` sur atelier
+- Pas de clés GPG privées sur atelier
+- Pas de seed Bitcoin sur atelier
+- Pas de Mullvad account number dans un fichier sur atelier
+- Uniquement les clés SSH opérationnelles nécessaires
+
+Si atelier est compromise, elle doit pouvoir être détruite et reconstruite sans perte de secret. C'est son rôle de cockpit, pas de coffre-fort.
+
+---
+
+## Divers
+
+### Commandes utiles à avoir sous la main
+
+```sh
+# Identifier un réseau libvirt
+sudo virsh net-list --all
+sudo virsh net-dumpxml <nom>
+
+# Identifier une VM
+sudo virsh list --all
+sudo virsh dumpxml <nom> | less
+
+# Voir taps attachés à un bridge
+ip link show master virbr0
+
+# Forcer une interface tap UP
+sudo ip link set vnetX up
+
+# Baux DHCP libvirt
+sudo virsh net-dhcp-leases <nom>
+
+# Logs VM
+sudo tail -f /var/log/libvirt/qemu/<nom>.log
+
+# pf OpenBSD
+doas pfctl -si         # status + stats
+doas pfctl -sr         # règles filter
+doas pfctl -sn         # règles NAT
+doas pfctl -nf /etc/pf.conf   # valider syntaxe
+doas pfctl -f /etc/pf.conf    # appliquer
+
+# unbound
+doas unbound-checkconf
+doas rcctl restart unbound
+dig @127.0.0.1 example.com
+tail -30 /var/log/daemon | grep unbound
+```
+
+---
+
+## TODO
+
+- [ ] Résoudre autostart X au login TTY1
+- [ ] Rédiger `RECOVERY.md` (procédures de récupération complètes)
+- [ ] Tester restore depuis snapshot phase04 avant de continuer phase 05
+- [ ] Migrer vers YubiKey en phase 06
+- [ ] Automatiser backup hebdomadaire qcow2
+- [ ] Contribuer les corrections au repo farm-os via PR (trou `tls-cert-bundle` surtout)
