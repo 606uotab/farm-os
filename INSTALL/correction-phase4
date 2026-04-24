@@ -1,0 +1,274 @@
+# farm-os — Feuille de correction phase 04
+
+Synthèse des erreurs, omissions et améliorations identifiées dans `INSTALL/BASE.md` sections 04.A à 04.L pendant la session de débogage du 24-25 avril 2026 (et persistance validée le 26).
+
+Cible : repo `606uotab/farm-os`, branche `main`, fichier `INSTALL/BASE.md`.
+
+-----
+
+## 1. Bug bloquant : `<n>` au lieu de `<name>` dans les XML libvirt
+
+**Sections concernées** : 04.B (bridges br-wan, br-vpn, br-direct).
+
+**Problème** : les heredocs des trois XML utilisent la balise `<n>br-wan</n>` (ainsi que `br-vpn`, `br-direct`) à la place de `<name>br-wan</name>`. C’est très probablement une coquille de rendu Markdown sur GitHub qui a mangé une balise au moment du commit, mais copié tel quel dans un terminal le `virsh net-define` échoue ou crée un network sans nom utilisable.
+
+**Correction** : remplacer dans les trois blocs de code :
+
+```diff
+- <n>br-wan</n>
++ <name>br-wan</name>
+```
+
+Idem pour `br-vpn` et `br-direct`.
+
+À auditer aussi en phase 02 et 03 par cohérence (au cas où la même substitution aurait eu lieu ailleurs dans le repo).
+
+-----
+
+## 2. Bug critique : IP forwarding manquant en runtime alors que la doc dit qu’il est fait
+
+**Section concernée** : 04.E (IP forwarding sur OpenBSD).
+
+**Problème observé** : la doc 04.E indique bien la commande `doas sysctl net.inet.ip.forwarding=1` puis `echo "net.inet.ip.forwarding=1" | doas tee -a /etc/sysctl.conf`. Mais lors de l’installation suivie pas-à-pas, l’état final du router avait `net.inet.ip.forwarding = 0`, ce qui a masqué pendant des heures tous les autres diagnostics (le router avait internet à lui-même via unbound, mais ne forwardait pas atelier).
+
+**Cause probable** : `tee -a` ne signale aucune erreur si le fichier existe déjà avec une variante de la ligne, ou si une commande antérieure a écrit la clé sans valeur (ce qui s’est exactement produit pendant la session : `echo "net.inet.ip.forwarding"` au lieu de `"net.inet.ip.forwarding=1"`).
+
+**Corrections à apporter à la doc** :
+
+1. Ajouter une **vérification immédiate** après le `tee` :
+   
+   ```bash
+   echo "net.inet.ip.forwarding=1" | doas tee -a /etc/sysctl.conf
+   doas grep -E '^net\.inet\.ip\.forwarding' /etc/sysctl.conf
+   # Doit afficher EXACTEMENT : net.inet.ip.forwarding=1
+   # Si plusieurs lignes ou valeur différente, corriger manuellement.
+   ```
+1. Ajouter dans **04.L (Vérifications finales)** un test croisé qui aurait détecté le souci tout de suite :
+   
+   ```bash
+   # Depuis atelier :
+   ping -c 3 9.9.9.9
+   # Si ça échoue alors que router lui-même peut pinger 9.9.9.9, le forwarding
+   # est probablement off sur le router. Vérifier sur router :
+   sysctl net.inet.ip.forwarding   # doit dire =1
+   ```
+1. Mention dans **Troubleshooting** : un cas explicite « atelier ne sort pas mais router oui » avec la pointe vers `sysctl net.inet.ip.forwarding`.
+
+-----
+
+## 3. Omission majeure : taps libvirt qui restent DOWN au démarrage des VMs sur Void
+
+**Sections concernées** : 04.B (création des networks), 04.I (test VM jetable), 04.J (migration atelier).
+
+**Problème observé** : sur Void avec libvirtd monolithique, les tap devices (`vnetXX`) attachés aux bridges `virbr-*` sont créés en état `DOWN` lorsque la VM démarre. Sans intervention manuelle, le bridge reste `NO-CARRIER` et aucun trafic L2 ne passe. La doc 04.J n’indique nulle part qu’il faut un `ip link set vnetXX up` ni un hook libvirt.
+
+**Conséquence** : reproduit fidèlement, le pas-à-pas de la doc bloque dès la VM jetable Alpine de 04.I (DHCP qui échoue) ou plus tard à la migration de l’atelier sur br-vpn.
+
+**Corrections à apporter** :
+
+1. Ajouter une nouvelle section avant 04.I, par exemple **04.E.bis — Hook libvirt pour l’auto-UP des taps** :
+   
+   ```bash
+   sudo mkdir -p /etc/libvirt/hooks
+   
+   sudo tee /etc/libvirt/hooks/qemu > /dev/null <<'EOF'
+   #!/bin/sh
+   # Hook libvirt : force les taps UP au démarrage VM.
+   # Sur Void avec libvirtd monolithique, certains taps restent DOWN après
+   # attachement au bridge ; sans ça, le bridge reste NO-CARRIER et le L2 ne
+   # passe pas.
+   
+   GUEST_NAME="$1"
+   HOOK_NAME="$2"
+   STATE="$3"
+   
+   case "$HOOK_NAME/$STATE" in
+       started/begin)
+           (
+             sleep 2
+             virsh domiflist "$GUEST_NAME" 2>/dev/null | \
+               awk 'NR>2 && $1 ~ /^vnet/ {print $1}' | \
+               while read tap; do
+                   ip link set "$tap" up 2>/dev/null
+               done
+           ) &
+           ;;
+   esac
+   
+   exit 0
+   EOF
+   
+   sudo chmod +x /etc/libvirt/hooks/qemu
+   sudo sv restart libvirtd
+   ```
+1. Ajouter dans **Troubleshooting** : « Bridge en NO-CARRIER, ping inter-VM en Destination Host Unreachable ».
+   
+   ```bash
+   bridge link
+   # Si des vnet apparaissent en "state disabled" alors que les VMs tournent,
+   # c'est le quirk Void/libvirt. Vérifier que le hook /etc/libvirt/hooks/qemu
+   # est bien en place et exécutable, puis relancer libvirtd.
+   ```
+1. Mentionner explicitement, en début de phase 04, que cette phase requiert le hook si la cible est Void Linux (rolling release `libvirt` monolithique).
+
+-----
+
+## 4. Erreur factuelle : `isc-dhcp-client` n’est plus le client DHCP par défaut sur Debian 13
+
+**Section concernée** : 04.J Troubleshooting (« L’atelier n’obtient pas d’IP sur br-vpn ») et implicitement la fin de phase 02.
+
+**Problème observé** : la doc suggère `sudo dhclient -v enp1s0`. Or sur Debian 13 (Trixie), une install minimale fournit **`dhcpcd-base`**, pas `isc-dhcp-client`. La commande `dhclient` n’existe pas, ce qui a provoqué une perte de temps significative pendant la session.
+
+**Corrections à apporter** :
+
+1. Dans 04.J, remplacer la section dhclient par une version conditionnelle :
+   
+   ```bash
+   # Identifier le client DHCP installé
+   dpkg -l | grep -E 'dhcpcd|isc-dhcp-client'
+   
+   # Selon le résultat :
+   # - dhcpcd-base présent (Debian 13+) :
+   sudo dhcpcd -B enp1s0
+   # - isc-dhcp-client présent (Debian 12-) :
+   sudo dhclient -v enp1s0
+   ```
+1. Pour la persistance via `/etc/network/interfaces` en `inet dhcp`, indiquer que `ifupdown` appelle automatiquement le client DHCP disponible (`dhcpcd` ou `dhclient`), donc la config est portable.
+1. Note : le service `dhcpcd.service` n’existe pas comme unit systemd avec `dhcpcd-base` seul. Préciser dans Troubleshooting que le mécanisme officiel sur Debian 13 minimal est bien `ifupdown` + `dhcpcd-base`, déclenché via `/etc/network/interfaces`.
+
+-----
+
+## 5. Omission : `enp1s0 inet static` sans bloc `address`
+
+**Section concernée** : 04.J (migration atelier sur br-vpn) — implicite, hérité de 02.
+
+**Problème observé** : sur l’atelier installée en phase 02, `/etc/network/interfaces` contient par défaut :
+
+```
+allow-hotplug enp1s0
+iface enp1s0 inet static
+```
+
+…sans bloc `address`/`netmask`/`gateway`. Cette stanza est syntactiquement valide mais ne fait rien : `ifup -a` la lit, ne configure aucune IP, et l’interface reste DOWN au boot. Comportement piège, source de confusion massive (« l’interface est UP mais sans IP, et networking.service est `active (exited)` avec status 0 »).
+
+**Correction à apporter** : la phase 02 devrait soit :
+
+1. **Préférée** : laisser le `iface enp1s0 inet dhcp` que l’installateur Debian aurait dû mettre, et le mentionner explicitement.
+1. **Alternative** : si la phase 02 utilise `default` NAT libvirt et qu’on prévoit de migrer plus tard, écrire d’emblée :
+   
+   ```
+   allow-hotplug enp1s0
+   iface enp1s0 inet dhcp
+   ```
+
+Et dans 04.J, ajouter un check explicite :
+
+```bash
+# Sur atelier, vérifier que la stanza enp1s0 est bien en DHCP avant de migrer
+grep -A2 'enp1s0' /etc/network/interfaces
+# Doit contenir : iface enp1s0 inet dhcp
+# Si "inet static" sans IP : remplacer par "inet dhcp"
+```
+
+-----
+
+## 6. Inexactitude : `rcctl check pf` n’existe pas sur OpenBSD
+
+**Section concernée** : 04.L (vérifications finales).
+
+**Problème observé** : la doc liste `doas rcctl check dhcpd unbound` qui marche, mais des utilisateurs (dont moi pendant la session) étendent ça à `pf` par analogie. Or `pf` n’est pas géré par `rcctl` — c’est intégré au kernel et géré par `pfctl`. La sortie est :
+
+```
+rcctl: "pf" is a special variable, no rc.d(8) script
+```
+
+**Correction à apporter** : préciser explicitement dans 04.L :
+
+```bash
+doas rcctl check dhcpd unbound      # services rc.d
+doas pfctl -si | grep Status        # statut de pf (intégré kernel)
+# Attendu : Status: Enabled
+```
+
+-----
+
+## 7. Risque non documenté : snapshots créés alors qu’une instabilité runtime persiste
+
+**Section concernée** : 04.K (snapshots).
+
+**Observation** : pendant la session, j’ai pu créer les snapshots `phase04-router-complet` et `phase04-on-br-vpn` proprement (VMs éteintes), mais après le snapshot un cycle reboot a fait revenir un état réseau cassé (taps DOWN, bridges NO-CARRIER) qui n’a été résolu que par un reboot complet de Void. Si les snapshots avaient été pris pendant cette fenêtre instable, on aurait gravé un état défectueux dans le snapshot.
+
+**Correction à apporter** : ajouter à 04.K une vérification post-snapshot :
+
+```bash
+# Après snapshot, redémarrer les deux VMs et faire un test bout en bout
+sudo virsh start router
+sleep 30
+sudo virsh start atelier
+sleep 15
+
+# Depuis atelier, vérifier sans intervention manuelle :
+ip -br addr   # enp1s0 doit avoir 10.0.10.50/24 automatiquement
+ip route      # default via 10.0.10.1
+ping -c 3 9.9.9.9   # internet via router
+```
+
+Si l’un des trois échoue, **ne pas considérer la phase 04 comme close** : le snapshot pris est techniquement valide mais ne reflète pas un état fonctionnel persistant.
+
+-----
+
+## 8. Note opérationnelle : reboot de Void parfois nécessaire
+
+**Observation** : à plusieurs reprises pendant la session (après cycle snapshot, après modifications répétées de l’état runtime des bridges), seul un reboot complet de Void a permis de retrouver un état réseau propre — alors que `sv restart libvirtd` + cycles `net-destroy/net-start` n’avaient pas suffi.
+
+**Correction à apporter** : ajouter dans Troubleshooting une note explicite :
+
+> Si après plusieurs manipulations runtime des networks libvirt, des taps ou des bridges, le réseau reste dans un état incohérent (taps disabled persistants, bridge NO-CARRIER même quand un tap est UP), un reboot complet de l’hôte Void résout généralement le problème en réinitialisant l’état kernel des bridges, des taps et de libvirtd. Ce n’est pas une étape attendue en utilisation normale, mais un dernier recours documenté.
+
+-----
+
+## 9. Suggestion : `bridge link` recommandé comme première vérification L2
+
+**Section concernée** : 04.B (création des networks), 04.L (vérifications).
+
+**Observation** : la doc utilise `ip link show | grep virbr` comme check, mais `bridge link` est strictement supérieur : il montre l’état du **port slave** (forwarding/disabled/blocking) ce qui est exactement le diagnostic dont on a besoin.
+
+**Correction suggérée** : remplacer/compléter dans 04.B :
+
+```bash
+ip link show | grep -E 'virbr'
+bridge link
+# Pour chaque vnet attaché à un virbr, on doit voir "state forwarding"
+# Si "state disabled" pour un vnet de VM en cours d'exécution :
+# voir Troubleshooting "Bridge en NO-CARRIER".
+```
+
+-----
+
+## 10. Récapitulatif synthétique des modifications de doc à pousser
+
+Par ordre de priorité :
+
+1. **Critique** — Corriger `<n>` → `<name>` dans les XML libvirt (section 04.B). Sans ça la doc n’est littéralement pas exécutable copy-paste.
+1. **Critique** — Documenter le hook libvirt `/etc/libvirt/hooks/qemu` comme prérequis Void. Sans ça la phase 04 bloque dès l’attachement de la première VM.
+1. **Important** — Vérification post-tee de `/etc/sysctl.conf` (section 04.E) avec un grep explicite, et test croisé atelier→9.9.9.9 dans 04.L.
+1. **Important** — Mettre à jour la procédure DHCP atelier pour Debian 13 (`dhcpcd-base`, pas `dhclient`).
+1. **Important** — Vérifier/imposer `iface enp1s0 inet dhcp` en phase 02 ou check explicite en 04.J.
+1. **Mineur** — Préciser `pfctl -si` au lieu de `rcctl check pf` en 04.L.
+1. **Mineur** — Validation post-snapshot avec reboot complet en 04.K.
+1. **Mineur** — Note Troubleshooting sur le reboot de Void en dernier recours.
+1. **Mineur** — Recommandation `bridge link` comme première vérification L2.
+
+-----
+
+## 11. Hors scope — observations pour les phases suivantes
+
+À garder en tête pour quand on attaquera les phases 05+ :
+
+- L’`<sysctl_check>` du forwarding IP (point 2 ci-dessus) deviendra encore plus important en phase 05 (Mullvad wg0) puisqu’il faudra que les paquets transitent guest→wg0 via le router, ce qui dépend du forwarding.
+- Le hook libvirt actuel (`started/begin` + sleep 2 + boucle vnet) est suffisant pour phase 04. En phase 05, vérifier qu’il ne crée pas de race condition avec la création de wg0 sur le router.
+- La syntaxe `<source network='br-vpn'/>` dans les XML de VM (qui marche) suppose que le `<name>br-vpn</name>` du network est correct — encore une fois, dépendance directe au point 1.
+
+-----
+
+*Fin de la feuille de correction phase 04.*
