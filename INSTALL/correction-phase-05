@@ -1,0 +1,563 @@
+# farm-os — Corrections BASE.md issues de la session phase 05
+
+Document de correction consolidé de la session du 25-26 avril 2026, à intégrer dans BASE.md du repo `606uotab/farm-os`.
+
+Format : pour chaque section concernée, on liste **ce que dit la doc actuelle**, **ce qui n’a pas marché**, **ce qu’il faut écrire à la place**.
+
+-----
+
+## Phase 04 — Corrections rétroactives
+
+### 4.1. Bug typo `/etc/sysctl.conf`
+
+**Doc actuelle (Section E)** :
+
+```bash
+# Persistance au boot
+echo "net.inet.ip.forwarding=1" | doas tee -a /etc/sysctl.conf
+```
+
+**Problème détecté** : pendant la session, on a découvert un fichier orphelin `/etc/systl.conf` (typo, sans le `c`) contenant la directive dupliquée. OpenBSD ne lit que `/etc/sysctl.conf`, donc le fichier typo était inerte. Le bon fichier `/etc/sysctl.conf` contenait bien la directive (donc l’IP forwarding fonctionnait quand même), mais le fichier typo orphelin polluait `/etc`.
+
+**Cause probable** : copier-coller depuis la doc avec autocorrect ou typo durant phase 04, qui a généré le fichier `/etc/systl.conf` (ou peut-être un script qui a glissé sur la commande `tee`).
+
+**Action recommandée** : ajouter en fin de Section E une vérification :
+
+```bash
+# Vérifier qu'il n'y a pas de typo
+ls /etc/sys*.conf
+# Doit afficher UNIQUEMENT /etc/sysctl.conf
+# Si on voit /etc/systl.conf : doas rm /etc/systl.conf
+
+# Vérifier le contenu
+doas cat /etc/sysctl.conf
+# Doit contenir net.inet.ip.forwarding=1 (une seule fois)
+```
+
+### 4.2. Règles pf manquantes pour DNS et sortie Internet depuis bridges
+
+**Doc actuelle (Section F)** propose :
+
+```pf
+# --- Services réseau internes (DHCP et DNS) ---
+pass in quick on { $vpn_if $dir_if } proto udp from any port 68 to port 67 keep state
+pass in quick on { $vpn_if $dir_if } proto { tcp udp } to self port domain keep state
+
+# ...
+
+# --- Autoriser clients internes à sortir sur Internet via WAN ---
+pass in quick on $vpn_if inet from $vpn_net to any keep state
+pass in quick on $dir_if inet from $dir_net to any keep state
+```
+
+**Problème détecté en phase 05** : ces règles fonctionnaient en phase 04 (sortie directe via vio0) mais sont devenues incomplètes en phase 05 quand on a tenté de router le trafic via wg0. Et plus généralement, la règle `to self port domain` ne couvre que le DNS, pas le HTTP/HTTPS.
+
+**À noter** : la doc phase 04 actuelle est **correcte pour phase 04**, mais elle implique que la phase 05 doit **ajouter** des règles, ce qui est sous-documenté.
+
+### 4.3. NTP : drift d’horloge inattendu
+
+**Phénomène observé** : pendant la session, ntpd ajustait l’horloge router de **+57000 secondes** répétitivement à chaque cycle, sans converger. Logs systématiques `adjusting local clock by 57247.140710s`.
+
+**Cause possible** : horloge VM mal initialisée au moment de la création (timezone hardware/UTC), ou drift hardware fort après un suspend/resume de la VM.
+
+**Conséquence** : peut casser TLS (certificats vus comme invalides côté router), peut affecter les handshakes VPN.
+
+**Action recommandée** : ajouter un test à la fin de la phase 04 :
+
+```bash
+date
+doas rcctl check ntpd
+# Si date manifestement fausse : doas rdate -ncv pool.ntp.org
+```
+
+-----
+
+## Phase 05 — Réécriture nécessaire
+
+### 5.1. Section A — Multihop Norvège→Islande obsolète
+
+**Doc actuelle** :
+
+> Tunnel **Mullvad WireGuard** multihop (Norvège → Islande) actif sur `br-vpn` avec kill-switch.
+
+**Problème détecté** : Mullvad ne propose plus l’Islande dans ses serveurs WireGuard en avril 2026. La référence NO→IS dans toute la doc (intro, plan des phases, nom des fichiers) doit être mise à jour.
+
+**Choix de remplacement testé en session** : NO→SE (entrée Norvège Oslo, sortie Suède Malmö `se-mma-wg-005`). Validé fonctionnel.
+
+**Discussion juridiction à documenter dans BASE.md ou ARCHITECTURE.md** :
+
+|Pays sortie      |Avantage                                               |Note                                        |
+|-----------------|-------------------------------------------------------|--------------------------------------------|
+|Suède            |Mullvad HQ, robustesse prouvée par raid 2023 sans fuite|14 Eyes mais sans data retention obligatoire|
+|Suisse           |Hors 14 Eyes, juridiction privacy max                  |Recommandé pour exit                        |
+|Espagne, Finlande|Faible surveillance, peu de logs                       |Alternative correcte                        |
+
+À noter : la Norvège **est compromise pour entrée pure** (programme NORUS avec NSA depuis Snowden 2014). Reste acceptable comme entrée car le serveur d’entrée ne peut pas décrypter le payload (chiffré pour exit).
+
+### 5.2. Section A — Toggle multihop grisé sur portail
+
+**Phénomène détecté** : sur certains comptes Mullvad, le toggle “Multihop” dans le WireGuard configuration generator est grisé (raison non documentée, probablement A/B testing ou config server-side).
+
+**Solution** : ne pas dépendre du toggle. Le multihop se construit **manuellement** :
+
+- Télécharger un `.conf` single-hop pour le serveur d’entrée souhaité (ex: Norvège)
+- Récupérer **séparément** la `PublicKey` et le `multihop port` du serveur de sortie souhaité (ex: Suède Malmö)
+- Construire l’`Endpoint` final : `IP_serveur_entrée:port_multihop_sortie`
+- Mettre la `PublicKey` du serveur de **sortie** dans `wgpeer`
+
+**À ajouter dans BASE.md section B** :
+
+```
+Le multihop Mullvad fonctionne en chiffrant le payload pour le serveur de SORTIE,
+mais en l'envoyant à l'IP du serveur d'ENTRÉE sur un port spécifique.
+La pubkey à utiliser dans wgpeer est celle du serveur de SORTIE.
+Le serveur d'entrée relaie sans pouvoir décrypter (clé asymétrique).
+```
+
+### 5.3. Section B — Address dans le `.conf`, pas étape séparée
+
+**Doc actuelle (Section A étape 4)** :
+
+> Noter l’**IP attribuée** par Mullvad (format `10.64.X.Y/32`) — sera utilisée dans `/etc/hostname.wg0`
+
+**Problème** : la doc présente ça comme une étape séparée à noter manuellement. En réalité, l’IP attribuée est **dans le `.conf` téléchargé**, ligne `Address = 10.X.X.X/32`.
+
+**Reformulation correcte** :
+
+> Quand tu télécharges le `.conf` (étape suivante), il contient automatiquement ton IP attribuée à la ligne `Address = `. Pas besoin de la noter à part.
+
+### 5.4. Section B — IPv6 dans le `.conf` à ignorer
+
+**Doc actuelle** : ne mentionne pas l’IPv6 du `.conf`.
+
+**Réalité** : le `.conf` Mullvad téléchargé contient toujours une ligne du type :
+
+```
+Address = 10.71.182.204/32,fc00:bbbb:bbbb:bb01::8:b6cb/128
+```
+
+L’IPv6 (après la virgule) doit être **ignorée** dans notre setup OpenBSD car notre stack est IPv4-only (IPv6 désactivé sysctl côté Void en phase 01).
+
+**À ajouter dans BASE.md section B** :
+
+> Ignorer la partie IPv6 de la ligne `Address` (après la virgule). On ne configure que l’IPv4 dans `inet 10.X.X.X 255.255.255.255`.
+
+### 5.5. Section C — `/etc/hostname.wg0` corrigé
+
+**Doc actuelle (Section C)** :
+
+```
+wgkey <WG_PRIVKEY>
+wgpeer <PEER_PUBKEY> \
+    wgendpoint <PEER_ENDPOINT> <PEER_PORT> \
+    wgaip 0.0.0.0/0
+inet 10.64.123.45 255.255.255.255
+mtu 1420
+up
+```
+
+**Problèmes détectés** :
+
+1. **Manque `wgpka 25`** : sans persistent keep-alive, Mullvad expire le tunnel après quelques minutes d’inactivité, et le tunnel ne se ré-établit pas automatiquement.
+1. **MTU 1420 trop élevé** pour multihop. Provoque packet drops silencieux (le ping passe, mais le TLS handshake meurt). Mullvad recommande **1280** dans sa doc OpenWRT.
+1. **Manque les routes système** dans le fichier. Sans elles, le trafic VPN ne sait pas où aller.
+1. **Manque le piège du self-routing loop** : non documenté.
+
+**Version correcte** :
+
+```
+wgkey <PRIVATEKEY_DU_CONF>
+wgpeer <PUBKEY_SERVEUR_SORTIE> \
+    wgendpoint <IP_SERVEUR_ENTREE> <PORT_MULTIHOP_SORTIE> \
+    wgaip 0.0.0.0/0 \
+    wgpka 25
+inet <ADDRESS_DU_CONF_SANS_/32> 255.255.255.255
+mtu 1280
+up
+!/sbin/route -qn add -inet <IP_SERVEUR_ENTREE>/32 192.168.100.1
+!/sbin/route -qn add -inet 0.0.0.0/1 -iface <ADDRESS_DU_CONF_SANS_/32>
+!/sbin/route -qn add -inet 128.0.0.0/1 -iface <ADDRESS_DU_CONF_SANS_/32>
+```
+
+**Points critiques à documenter explicitement** :
+
+- **`\` de continuation** : présent à la fin des trois premières lignes du bloc `wgpeer` (`wgpeer`, `wgendpoint`, `wgaip`), **PAS** après `wgpka 25`. Une erreur de continuation casse le parsing avec l’erreur `wgpka: wgpeer not set`.
+- **Address sans `/32`** : copier `10.71.182.204` (sans le suffixe `/32` du `.conf`). Le `255.255.255.255` plus loin équivaut au /32.
+- **Permissions strictes** : `chmod 600 /etc/hostname.wg0` car contient la PrivateKey.
+- **Ordre des routes système** : la route `/32` pour l’endpoint Mullvad **doit venir avant** les routes `/1`, sinon les /1 capturent l’endpoint en premier et créent un self-routing loop.
+
+### 5.6. Section C — Self-routing loop (à documenter, piège majeur)
+
+**Phénomène** : avec les routes `0.0.0.0/1` et `128.0.0.0/1` qui pointent vers wg0, **toute** sortie passe par wg0, **y compris les paquets WireGuard chiffrés** qui devraient sortir vers `Endpoint Mullvad` via vio0. Boucle infinie : aucun paquet ne sort sur le wire physique, le tunnel ne s’établit jamais.
+
+**Symptôme** :
+
+- `wg show` affiche un peer mais sans `latest handshake`
+- `tcpdump -ni vio0 udp port 51820` ne montre **aucun trafic** sortant
+- Mais `ifconfig wg0` semble OK
+- `wg show` peut montrer un déséquilibre `transfer: X KiB received, Y GiB sent` (énorme send pour rien received)
+
+**Solution** : route `/32` plus spécifique pour l’IP de l’endpoint, qui pointe vers la gateway WAN (Livebox/Void) :
+
+```
+!/sbin/route -qn add -inet <IP_ENDPOINT>/32 192.168.100.1
+```
+
+**Cette route doit être ajoutée AVANT les routes /1** (dans `hostname.wg0`, l’ordre des `!route add` matters).
+
+**À ajouter en gros dans BASE.md** : encadré “ATTENTION : self-routing loop” avec ce piège expliqué.
+
+### 5.7. Section E — pf.conf : abandon de `route-to`
+
+**Doc actuelle (Section E)** :
+
+```pf
+# --- br-vpn : TOUT le reste doit passer par wg0 (kill-switch) ---
+pass in quick on $vpn_if inet from $vpn_net to any route-to $vpn_out keep state
+```
+
+**Problème majeur** : sur OpenBSD depuis 2021 (commit visible dans https://undeadly.org), `route-to` accepte uniquement des **IPs next-hop**, plus des interfaces. Toutes les variantes ont été testées en session et échouent :
+
+- `route-to wg0` → `pf: syntax error` ligne 36
+- `route-to (wg0 10.71.182.204)` → `pf: syntax error`
+- `route-to ($wg_if $wg_local)` → `pf: syntax error`
+- `route-to 10.71.182.204` → accepté mais ne sert à rien (boucle vers soi-même)
+
+**Pour wg0 (point-to-point), il n’y a pas de “next-hop IP” classique** au sens routing system, donc `route-to` ne peut pas fonctionner.
+
+**Solution adoptée** : routes système dans `hostname.wg0` (cf. 5.5), pas de `route-to` dans pf.
+
+**Action sur BASE.md** : retirer toute mention de `route-to` dans la section E. Le routage VPN est géré au niveau routing system (routes /1), pas au niveau pf.
+
+### 5.8. Section E — pf.conf complet réécrit
+
+**Version testée et fonctionnelle** :
+
+```pf
+# /etc/pf.conf — phase 05 Mullvad multihop NO→SE
+
+# === Macros ===
+wan_if  = "vio0"
+vpn_if  = "vio1"
+dir_if  = "vio2"
+wg_if   = "wg0"
+vpn_net    = "10.0.10.0/24"
+direct_net = "10.0.20.0/24"
+
+# === Options ===
+set skip on lo
+set block-policy return
+
+# === Normalisation ===
+# IMPORTANT : max-mss 1200 (pas 1440) pour TLS via tunnel multihop
+match in all scrub (no-df random-id max-mss 1200)
+
+# === NAT ===
+match out on $wg_if  inet from $vpn_net    to any nat-to ($wg_if:0)
+match out on $wg_if  inet from (self)      to 10.64.0.1 nat-to ($wg_if:0)
+match out on $wan_if inet from $direct_net to any nat-to ($wan_if:0)
+match out on $wan_if inet from (self)      to any nat-to ($wan_if:0)
+
+# === Pass out router → DNS Mullvad ===
+pass out on $wg_if inet from (self) to 10.64.0.1 keep state
+
+# === Règles par défaut ===
+block drop log all
+
+# === Kill-switch fail-closed ===
+block return out quick on $wan_if inet from $vpn_net to any
+
+# === SSH interne ===
+pass in quick on $vpn_if inet proto tcp from $vpn_net    to ($vpn_if) port 22
+pass in quick on $dir_if inet proto tcp from $direct_net to ($dir_if) port 22
+
+# === DNS interne ===
+pass in quick on $vpn_if inet proto { tcp udp } from $vpn_net    to ($vpn_if) port 53
+pass in quick on $dir_if inet proto { tcp udp } from $direct_net to ($dir_if) port 53
+
+# === ICMP interne (debug) ===
+pass in quick on $vpn_if inet proto icmp icmp-type echoreq
+pass in quick on $dir_if inet proto icmp icmp-type echoreq
+
+# === Sortie Internet pour les bridges ===
+pass in quick on $vpn_if inet from $vpn_net    keep state
+pass in quick on $dir_if inet from $direct_net keep state
+
+# === Trafic IN depuis WAN : tout bloquer sauf retours d'état ===
+block in quick on $wan_if
+
+# === Sorties autorisées du router lui-même ===
+pass out quick inet keep state
+
+# === Isolation inter-bridges ===
+block drop quick on $vpn_if inet from $vpn_net    to $direct_net
+block drop quick on $dir_if inet from $direct_net to $vpn_net
+```
+
+**Différences notables avec la doc actuelle** :
+
+|Élément                           |Doc actuelle                          |Version testée                                            |
+|----------------------------------|--------------------------------------|----------------------------------------------------------|
+|`max-mss`                         |1440                                  |**1200** (critique pour TLS multihop)                     |
+|`route-to` dans pf                |Présent                               |**Retiré** (incompatible)                                 |
+|NAT `(self)` → 10.64.0.1 via wg0  |Absent                                |**Ajouté** (essentiel pour DNS)                           |
+|`block-policy`                    |`drop`                                |**`return`** (cohérent avec `block return out quick`)     |
+|Règles `pass in` DNS sur vio1/vio2|Absentes                              |**Ajoutées** (sinon DNS bloqué par catch-all)             |
+|Règles `pass in` sortie Internet  |Absentes                              |**Ajoutées** (sinon TCP atelier bloqué)                   |
+|Kill-switch                       |`block quick on $wan_if from $vpn_net`|**`block return out quick on $wan_if inet from $vpn_net`**|
+
+### 5.9. Section E — `max-mss 1200` critique
+
+**Phénomène observé** : avec `max-mss 1440` (valeur de la doc), les paquets TCP gros (TLS Client Hello, transferts HTTPS) échouent silencieusement.
+
+**Symptôme** :
+
+- `ping 1.1.1.1` passe
+- `curl https://api.ipify.org` timeout au moment du TLS handshake
+- Sur tcpdump : connexion TCP établie, Client Hello envoyé, puis `Connexion ré-initialisée par le correspondant`
+
+**Cause** : le MTU effectif du tunnel multihop WireGuard est plus bas que 1500. Avec scrub à 1440, les paquets TCP négocient un MSS de 1440 mais sont fragmentés/droppés en sortie de wg0 (MTU 1280).
+
+**Solution** : `max-mss 1200`. Marge confortable pour overhead WireGuard + multihop.
+
+### 5.10. Section F — Unbound : `name: "."` obligatoire
+
+**Doc actuelle (Section F)** :
+
+```
+forward-zone:
+    name: "."
+    forward-addr: 10.64.0.1
+```
+
+**OK dans la doc**. Mais lors d’une édition pendant la session, on a accidentellement omis `name: "."` :
+
+```
+forward-zone:
+    forward-addr: 10.64.0.1
+```
+
+**Conséquence** : Unbound démarrait sans erreur, répondait aux clients, mais **ne forwardait rien**. Les requêtes tombaient dans la résolution récursive normale (root servers), qui échouait à cause des routes /1 qui poussent tout dans wg0 sans NAT (self).
+
+**À renforcer dans la doc** : préciser que `name: "."` est **obligatoire** pour activer la forward-zone (sans nom de zone, Unbound ignore le bloc).
+
+### 5.11. Section F — Mullvad DNS plus en DoT
+
+**Doc actuelle (Section F, en option dans `forward-tls-upstream`)** :
+
+```
+forward-tls-upstream: yes
+forward-addr: 9.9.9.9@853#dns.quad9.net
+```
+
+**Quad9 obsolète pour notre setup** : avec les routes /1, les requêtes Quad9 partent dans wg0, mais le NAT actuel ne couvre pas le trafic du router lui-même → drop silencieux ou réponses qui n’arrivent pas.
+
+**Doc actuelle suggère ensuite** :
+
+```
+forward-zone:
+    name: "."
+    forward-addr: 10.64.0.1
+    # Mullvad DNS — en clair dans le tunnel WG
+```
+
+**Vérification 2026** : `10.64.0.1` répond **uniquement en UDP/53** (pas en DoT/853). Si on tente :
+
+```
+forward-tls-upstream: yes
+forward-addr: 10.64.0.1@853#dns.mullvad.net
+```
+
+→ timeout (paquets vers `:853` partent mais pas de réponse). Donc :
+
+**Configuration correcte** :
+
+```
+forward-zone:
+    name: "."
+    forward-addr: 10.64.0.1
+```
+
+**Pas de `forward-tls-upstream: yes`** sur cette config.
+
+**Note importante** : DNS reste **chiffré** par WireGuard (le tunnel chiffre tout). Pas de DoT donc, mais pas de DNS leak non plus, car les paquets ne sortent jamais du tunnel.
+
+### 5.12. Section G — Tests fonctionnels mis à jour
+
+**Doc actuelle (Section G)** :
+
+```bash
+curl -s https://am.i.mullvad.net/connected
+# Doit afficher "You are connected to Mullvad (...) Exit: Reykjavik, Iceland..."
+```
+
+**Nouvelle réalité** :
+
+```bash
+curl -s https://am.i.mullvad.net/connected
+# Doit afficher "You are connected to Mullvad (server se-mma-wg-005)" pour multihop NO→SE
+# (ou autre serveur selon ton choix d'exit)
+```
+
+### 5.13. Test du kill-switch — procédure validée
+
+**Doc actuelle** propose juste une note rapide. Voici une procédure complète validée en session :
+
+**Étape 1** : confirmer que tout marche.
+
+```bash
+# Sur atelier
+curl -s -m 5 https://api.ipify.org && echo
+# Doit afficher l'IP publique du serveur Mullvad de sortie
+```
+
+**Étape 2** : couper wg0.
+
+```bash
+# Sur router
+doas ifconfig wg0 destroy
+ifconfig wg0
+# Doit retourner "no such interface"
+```
+
+**Étape 3** : tester depuis l’atelier — aucun trafic ne doit sortir.
+
+```bash
+ping -c 3 -W 2 1.1.1.1
+# Attendu : "Destination Port Unreachable" ou 100% packet loss
+
+curl -s -m 5 https://api.ipify.org && echo
+# Attendu : aucune sortie (timeout)
+
+curl -s -m 5 https://example.com && echo
+# Attendu : aucune sortie
+
+host debian.org 10.0.10.1
+# Attendu : timeout
+```
+
+Aucune des commandes ne doit afficher d’IP réelle ni de contenu HTML.
+
+**Étape 4** : réactiver.
+
+```bash
+# Sur router
+doas sh /etc/netstart wg0
+sleep 30 && doas wg show
+# Doit montrer "latest handshake" récent
+```
+
+**Étape 5** : revalider depuis atelier.
+
+```bash
+curl -s -m 5 https://api.ipify.org && echo
+# Doit re-afficher l'IP Mullvad
+```
+
+### 5.14. Test de persistance reboot
+
+**Doc actuelle** : non documenté.
+
+**Procédure validée en session** :
+
+```bash
+# État de référence
+curl -s https://am.i.mullvad.net/connected   # depuis atelier
+
+# Reboot router
+doas reboot   # sur router
+
+# Attendre ~30 secondes que router remonte
+ping -c 3 -W 2 10.0.10.1   # depuis atelier — doit re-répondre
+
+# Validation post-reboot
+ping -c 2 debian.org
+curl -s https://am.i.mullvad.net/connected
+# Tout doit fonctionner sans intervention manuelle
+```
+
+Si OK : la persistance des routes système (via `!route add` dans `hostname.wg0`) est confirmée, et le `wgpka 25` ré-établit le handshake automatiquement.
+
+-----
+
+## Hygiène opérationnelle
+
+### Sécurité des clés WireGuard
+
+**Doc actuelle** : ne mentionne pas les bonnes pratiques de manipulation des clés.
+
+**À ajouter** :
+
+```
+ATTENTION SÉCURITÉ :
+
+1. Ne JAMAIS poster une PrivateKey en clair (forum, chat, conversation IA, screenshot).
+
+2. Si une PrivateKey a été exposée même brièvement :
+   - Révoquer immédiatement la pubkey associée sur le portail Mullvad
+   - Régénérer une nouvelle paire (téléchargement nouveau .conf)
+   - Mettre à jour /etc/hostname.wg0 avec la nouvelle PrivateKey
+
+3. Pendant le debug, éviter `cat /etc/hostname.wg0` qui révèle la PrivateKey.
+   Utiliser : doas grep -v wgkey /etc/hostname.wg0
+
+4. La PublicKey peut être partagée librement (c'est sa fonction).
+   Elle correspond à ce qu'on voit dans `wg show` et sur le portail Mullvad.
+```
+
+### Hygiène du `.conf` Mullvad téléchargé
+
+À ajouter dans la section B :
+
+```
+Une fois /etc/hostname.wg0 configuré, supprimer le .conf téléchargé qui
+contient la PrivateKey en clair :
+
+  rm -P chemin/vers/mullvad-XXX.conf
+
+(`rm -P` sur OpenBSD/BSD overwrite avant suppression. Sur Linux, utiliser `shred -u`.)
+```
+
+-----
+
+## Récapitulatif des modifications à BASE.md
+
+|# |Section                |Type                                          |Status session        |
+|--|-----------------------|----------------------------------------------|----------------------|
+|1 |Phase 04 § E           |Vérification typo `/etc/systl.conf`           |Bug corrigé en session|
+|2 |Phase 04 § F           |Doc explicite : pf nécessite ajout phase 05   |Identifié             |
+|3 |Phase 04 § fin         |Test horloge ntpd                             |Identifié             |
+|4 |Intro + plan + Phase 05|NO→IS → NO→SE (Islande obsolète)              |Validé NO→SE          |
+|5 |Phase 05 § A           |Discussion juridiction exit                   |À documenter          |
+|6 |Phase 05 § A-B         |Toggle multihop grisé : multihop manuel       |Documenté ici         |
+|7 |Phase 05 § B           |Address dans .conf, pas étape séparée         |Documenté ici         |
+|8 |Phase 05 § B           |IPv6 du .conf à ignorer                       |Documenté ici         |
+|9 |Phase 05 § C           |hostname.wg0 corrigé : wgpka, mtu 1280, routes|Validé                |
+|10|Phase 05 § C           |Encadré ATTENTION self-routing loop           |À documenter          |
+|11|Phase 05 § E           |Retirer toute mention de `route-to`           |Validé                |
+|12|Phase 05 § E           |pf.conf complet réécrit                       |Validé                |
+|13|Phase 05 § E           |`max-mss 1200` (pas 1440)                     |Validé                |
+|14|Phase 05 § F           |`name: "."` obligatoire                       |Confirmé              |
+|15|Phase 05 § F           |DoT 853 sur 10.64.0.1 plus disponible         |Validé UDP/53         |
+|16|Phase 05 § G           |Test exit Suède au lieu d’Islande             |Validé                |
+|17|Phase 05 § H+          |Procédure complète test kill-switch           |Validé                |
+|18|Phase 05 § I+          |Procédure test persistance reboot             |Validé                |
+|19|Toute la doc           |Hygiène clés WireGuard                        |À ajouter             |
+
+-----
+
+## Snapshot final session
+
+État opérationnel validé en fin de session du 26/04/2026 :
+
+- Tunnel WireGuard multihop NO→SE actif (entrée Norvège Oslo, sortie Suède Malmö)
+- Kill-switch fail-closed validé (zéro fuite quand wg0 down)
+- DNS Mullvad in-tunnel sans leak
+- Persistance reboot validée (router remonte tout seul)
+- Clés régénérées proprement, anciennes révoquées sur portail Mullvad
+
+Reste à faire :
+
+- Snapshots des VMs (atelier + router) en état phase 05 fonctionnelle
+- Mise à jour effective de BASE.md sur le repo avec les corrections de ce document
+- Phase 06 — Accès distant WireGuard inbound
