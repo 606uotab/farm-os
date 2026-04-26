@@ -1,0 +1,27 @@
+# Phase 06 — Accès distant : WireGuard inbound + SSH + virt-manager remote
+
+## Objectif
+
+Exposer le homelab à un peer extérieur (laptop, Pi, smartphone) via un tunnel **WireGuard inbound** terminé sur `obsd-router` (interface `wg2`, subnet `10.99.0.0/24`), puis administrer toutes les VMs en SSH avec ProxyJump et lancer `virt-manager` à distance vers `voidhv`. Cette phase est conçue pour cohabiter sans interférence avec le tunnel sortant Mullvad multihop NO→SE de la phase 05 et sans toucher aux tables nftables de libvirt.
+
+Le premier peer servant de banc de test est un **Raspberry Pi 5 16 Go avec écran**, simulé en client externe via le NAT loopback de la Livebox. Le second peer (mobile/laptop nomade) sera ajouté en phase 06bis.
+
+## Durée estimée
+
+3 à 4 heures, dont environ 30 minutes bloquées par la désactivation CGNAT côté Orange si le compte est en CGNAT par défaut.
+
+## Prérequis
+
+- Phase 05 révisée fonctionnelle, tunnel Mullvad multihop NO→SE actif, kill-switch `pf` fail-closed validé.
+- Snapshots `phase05-post-incident-26avril` présents pour `obsd-router` et `atelier`.
+- Accès admin Livebox Orange (mot de passe sous la box) pour vérifier le CGNAT et créer une redirection NAT/PAT.
+- Une adresse e-mail dédiée pour créer le compte deSEC.
+- Un Raspberry Pi 5 sous Debian 13 (Trixie) ou Raspberry Pi OS Trixie, avec `wireguard-tools`, `virt-manager` et `openbsd-netcat` installables.
+- `voidhv` joignable sur `192.168.100.1` depuis `obsd-router`.
+
+## Référence archi
+
+Voir `ARCHITECTURE.md` § « Accès distant ». Le tunnel inbound `wg2` est strictement séparé du tunnel sortant `wg0` (Mullvad) : aucun NAT inter-tunnels, aucun routage croisé.
+
+## Plan de l'accès distant
+
