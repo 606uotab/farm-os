@@ -1,0 +1,1337 @@
+# Phase 06 — Accès distant : WireGuard inbound + SSH + virt-manager remote
+
+**Objectif** : pouvoir piloter le homelab depuis n’importe où. Une interface WireGuard inbound `wg2` sur obsd-router accepte les connexions extérieures (un seul port UDP exposé). Une fois dans le tunnel, SSH vers OpenBSD + ProxyJump vers Void + virt-manager qemu+ssh donne un accès graphique complet à toutes les VMs. SSH sur Void est durci et ne binde que sur l’IP interne. DynDNS deSEC pour résoudre l’IP publique dynamique de la Livebox.
+
+**Durée estimée** : 3-4 h (sans compter la désactivation CGNAT Orange qui peut prendre plusieurs jours selon le support)
+
+**Prérequis** :
+
+- Phase 05 révisée fonctionnelle (snapshots `phase05-post-incident-26avril` pour router et atelier)
+- Tunnel Mullvad NO→SE actif, kill-switch validé
+- Accès admin Livebox Orange (mot de passe sous la box)
+- Une adresse e-mail dédiée pour deSEC
+- Un Raspberry Pi 5 (ou autre client Linux) accessible sur le LAN domestique pour les tests
+
+**Référence archi** : `ARCHITECTURE.md` §9 (Accès distant), §1 (SSH sur Void bindé interne).
+
+-----
+
+## A. Plan de l’accès distant
+
+```
+[Pi 5 sur LAN domestique]
+      |
+      | UDP 51820 → farmos.dedyn.io (deSEC, A dynamique)
+      V
+[Livebox Orange] -- port forward UDP 51820 --> [Void wlan0] -- DNAT nftables --> [obsd-router 192.168.100.10]
+                                                                                          |
+                                                                                     wg2 inbound
+                                                                                    (10.99.0.1/24)
+                                                                                          |
+[Pi maintenant 10.99.0.42] --ssh--> obsd-router
+                          --ssh ProxyJump--> voidhv (192.168.100.1)
+                          --virt-manager qemu+ssh://voidhv/system--> GUI complète
+```
+
+Choix tranchés (profil bitcoin/lunarpunk) :
+
+|Élément             |Valeur             |Raison                                            |
+|--------------------|-------------------|--------------------------------------------------|
+|Provider DynDNS     |deSEC (dedyn.io)   |open source, DNSSEC, no-KYC, association allemande|
+|Premier peer        |Raspberry Pi 5 16Go|banc de test, virt-manager natif                  |
+|Clés SSH            |ed25519 logicielles|FIDO2 reporté en phase 06bis                      |
+|Tor hidden service  |NON                |reporté en phase 06ter                            |
+|Interface WG inbound|`wg2`              |`wg1` réservé Mullvad Paris phase 07              |
+|Subnet WG inbound   |10.99.0.0/24       |aucun chevauchement                               |
+|Port externe        |UDP 51820          |standard                                          |
+|MTU client          |1380               |anti-fragmentation double-NAT                     |
+|PSK par peer        |OUI                |recommandation `man wg(4)`                        |
+|MASQUERADE Void     |NON                |préserve IP source pour logs WG                   |
+|sshd obsd-router    |écoute wg2 + vio1  |admin atelier sans tunnel                         |
+
+Variables globales à noter :
+
+```
+WG2_PORT=51820
+WG2_NET=10.99.0.0/24
+WG2_IP=10.99.0.1
+PI_WG_IP=10.99.0.42
+DESEC_DOMAIN=farmos.dedyn.io   # à choisir, doit être unique sur dedyn.io
+ROUTER_LAN_IP=192.168.100.10
+```
+
+-----
+
+## B. Vérification CGNAT Livebox (bloquant)
+
+Depuis janvier 2025, Orange active le CGNAT par défaut. Sans IP publique dédiée, **aucune redirection de port n’est possible** : la phase 06 est strictement bloquée.
+
+Sur l’atelier ou Void :
+
+```
+curl -s https://checkipv4.dedyn.io
+```
+
+Comparer avec l’IP WAN affichée dans la Livebox : `http://192.168.1.1` → mode avancé → **Réseau** → **Internet** → champ “Adresse IPv4 WAN”.
+
+Diagnostic :
+
+- Les deux IPs sont identiques → pas de CGNAT, continuer en C.
+- L’IP WAN Livebox est dans `100.64.0.0/10` (RFC 6598) → CGNAT actif, désactiver d’abord.
+
+**Désactivation côté Livebox** :
+
+1. `http://192.168.1.1` → mode avancé → **Réseau** → onglet **CGN** ou **IPv4 publique partagée**
+1. Décocher “mutualiser mon adresse IPv4” (libellé exact varie selon firmware)
+1. Valider, attendre 30 secondes que la box renégocie le bail WAN
+
+Si l’onglet CGN n’existe pas (firmware récent) : appeler le **3900** et demander explicitement “désactivation CGNAT, IP publique dédiée”. Refus fréquent en grand public 2025-2026, option parfois réservée aux contrats Pro.
+
+Re-vérifier après désactivation :
+
+```
+curl -s https://checkipv4.dedyn.io
+```
+
+Doit afficher la même IP que celle de la Livebox WAN, et ne PAS commencer par `100.64.x.x`.
+
+-----
+
+## C. Création du compte deSEC et du domaine
+
+Sur l’atelier (Firefox dans XFCE) :
+
+1. Aller sur `https://desec.io/`, *Create Account*, email + mot de passe + captcha
+1. Cliquer le lien d’activation reçu par mail (expire en 12 h)
+1. Activer la 2FA TOTP via le frontend (recommandé)
+1. *Domains* → *Create new dynDNS domain* → nom sous `dedyn.io` (exemple : `farmos.dedyn.io`)
+
+DNSSEC est activé d’office, rien à configurer.
+
+### Génération du token API restreint
+
+Récupérer un token master via le frontend (*Account* → *Token management* → *Create token* → nom “master-bootstrap”, garder en mémoire).
+
+Sur l’atelier, créer un token dédié au DynDNS, restreint en écriture sur les RRsets A et AAAA, auto-expiration 30 jours sans usage :
+
+```
+MASTER_TOKEN="<token-master-créé-via-frontend>"
+DESEC_DOMAIN="farmos.dedyn.io"
+
+RESP=$(curl -fsS https://desec.io/api/v1/auth/tokens/ \
+  -H "Authorization: Token $MASTER_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"name":"dyndns-farmos","max_unused_period":"30 00:00:00",
+           "perm_create_domain":false,"perm_delete_domain":false,
+           "perm_manage_tokens":false}')
+
+echo "$RESP" | jq .
+TOKEN_ID=$(echo "$RESP" | jq -r .id)
+DYN_TOKEN=$(echo "$RESP" | jq -r .token)
+echo "TOKEN_ID=$TOKEN_ID"
+echo "DYN_TOKEN=$DYN_TOKEN"
+```
+
+**Le token n’est visible qu’une fois**. Le copier dans un fichier temporaire, on le déposera sur Void en section J.
+
+Attacher les policies (autorisation d’écriture sur A et AAAA pour ce domaine) :
+
+```
+for T in A AAAA; do
+  curl -fsS https://desec.io/api/v1/auth/tokens/$TOKEN_ID/policies/rrsets/ \
+    -H "Authorization: Token $MASTER_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data "{\"domain\":\"$DESEC_DOMAIN\",\"subname\":null,\"type\":\"$T\",\"perm_write\":true}"
+  echo
+done
+```
+
+Une fois validé, supprimer le token master (il a servi son but) :
+
+```
+# Récupérer son ID via : curl -fsS https://desec.io/api/v1/auth/tokens/ -H "Authorization: Token $MASTER_TOKEN" | jq
+# Puis :
+# curl -fsS -X DELETE https://desec.io/api/v1/auth/tokens/<ID_MASTER>/ -H "Authorization: Token $MASTER_TOKEN"
+```
+
+-----
+
+## D. Génération des clés WireGuard
+
+Sur **obsd-router** (SSH depuis atelier) :
+
+```
+doas mkdir -p /etc/wireguard
+doas chmod 700 /etc/wireguard
+cd /etc/wireguard
+
+# Clés serveur (OpenBSD)
+doas sh -c 'umask 077; wg genkey > wg2_server.key'
+doas sh -c 'cat wg2_server.key | wg pubkey > wg2_server.pub'
+
+# Pre-shared key (recommandée par man wg(4))
+doas sh -c 'umask 077; wg genpsk > wg2_pi.psk'
+
+doas ls -l /etc/wireguard/
+```
+
+Sur le **Pi** (terminal sur le Pi directement) :
+
+```
+sudo mkdir -p /etc/wireguard
+sudo chmod 700 /etc/wireguard
+cd /etc/wireguard
+
+# Clés client (générées sur le Pi, la privée ne sort jamais)
+sudo sh -c 'umask 077; wg genkey > farm-home.key'
+sudo sh -c 'cat farm-home.key | wg pubkey > farm-home.pub'
+
+sudo ls -l /etc/wireguard/
+```
+
+Récupérer la clé publique du Pi pour la mettre dans la config serveur. Sur le Pi :
+
+```
+sudo cat /etc/wireguard/farm-home.pub
+```
+
+Noter cette valeur (44 caractères base64 finissant par `=`). On l’appellera `PI_PUB`.
+
+Sur **obsd-router**, récupérer ce qu’on doit transférer au Pi (plus tard en section O) :
+
+```
+doas cat /etc/wireguard/wg2_server.pub
+doas cat /etc/wireguard/wg2_pi.psk
+```
+
+Ces deux valeurs (clé publique serveur + PSK) seront copiées sur le Pi au moment de créer `farm-home.conf`. La PSK doit être transmise par canal sécurisé (clé USB, QR code via `qrencode`, ou copie manuelle sur le réseau LAN trusted).
+
+-----
+
+## E. Configuration `wg2` sur OpenBSD
+
+Sur **obsd-router**, créer `/etc/hostname.wg2` :
+
+```
+WG2_PRIV=$(doas cat /etc/wireguard/wg2_server.key)
+PI_PUB="<coller-ici-la-pubkey-du-Pi>"
+PI_PSK=$(doas cat /etc/wireguard/wg2_pi.psk)
+
+doas tee /etc/hostname.wg2 > /dev/null <<EOF
+wgkey $WG2_PRIV
+wgport 51820
+wgpeer $PI_PUB wgpsk $PI_PSK wgaip 10.99.0.42/32 wgdescr "rpi5-banc-test"
+inet 10.99.0.1 255.255.255.0
+mtu 1420
+up
+EOF
+
+doas chmod 640 /etc/hostname.wg2
+```
+
+**Note** : `wgpka` (keepalive) n’est PAS mis côté serveur. Il sera mis côté Pi (peer derrière NAT). Le serveur ne connaît pas l’endpoint des peers (roaming WG), un keepalive serveur serait inutile.
+
+Activer le tunnel :
+
+```
+doas sh /etc/netstart wg2
+ifconfig wg2
+```
+
+Sortie attendue :
+
+```
+wg2: flags=80c3<UP,BROADCAST,RUNNING,NOARP,MULTICAST> mtu 1420
+        wgport 51820
+        wgpubkey <CLE_PUB_SERVEUR>
+        wgpeer <PI_PUB>
+                wgpsk (present)
+                wgaip 10.99.0.42/32
+                wgdescr "rpi5-banc-test"
+        inet 10.99.0.1 netmask 0xffffff00 broadcast 10.99.0.255
+```
+
+-----
+
+## F. Mise à jour `pf.conf` sur OpenBSD
+
+**Bug critique évité** : la macro `direct_net` (déclarée en phase 05) ne doit pas être confondue avec `dir_net` (qui n’existe pas et ferait planter le ruleset).
+
+**Bug critique d’ordre** : le `pass in quick on $wan_if proto udp port 51820` doit venir AVANT le `block in quick on $wan_if`, sinon le block matche en premier (à cause du `quick`) et le pass n’est jamais évalué.
+
+Sauvegarder l’actuel :
+
+```
+doas cp /etc/pf.conf /etc/pf.conf.phase05
+```
+
+Remplacer `/etc/pf.conf` :
+
+```
+doas vim /etc/pf.conf
+```
+
+Contenu complet à coller (`:set paste` puis `i` puis coller, `Esc :wq`) :
+
+```
+# /etc/pf.conf — phase 06 (WG inbound + Mullvad multihop préservé)
+
+# === Macros ===
+wan_if     = "vio0"
+vpn_if     = "vio1"
+dir_if     = "vio2"
+wg_if      = "wg0"
+wg_in      = "wg2"
+
+vpn_net    = "10.0.10.0/24"
+direct_net = "10.0.20.0/24"
+wg_in_net  = "10.99.0.0/24"
+
+wg_local    = "10.71.182.204"
+wg_endpoint = "141.98.253.165"
+
+void_ip    = "192.168.100.1"
+wg_in_port = "51820"
+
+# === Options ===
+set skip on lo
+set block-policy return
+set loginterface $wan_if
+
+# === Normalisation ===
+match in all scrub (no-df random-id max-mss 1200)
+
+# === Translation (NAT) ===
+match out on $wg_if  inet from $vpn_net    to any nat-to ($wg_if:0)
+match out on $wg_if  inet from (self)      to 10.64.0.1 nat-to ($wg_if:0)
+match out on $wan_if inet from $direct_net to any nat-to ($wan_if:0)
+match out on $wan_if inet from (self)      to any nat-to ($wan_if:0)
+
+# === Politique par défaut ===
+block drop log all
+
+# === Sorties autorisées du router lui-même ===
+pass out quick inet keep state
+
+# === Anti-fuite VPN (kill-switch fail-closed) ===
+block return out quick on $wan_if inet from $vpn_net to any
+
+# === DNS du router vers Mullvad via wg0 ===
+pass out on $wg_if inet from (self) to 10.64.0.1 keep state
+
+# === DHCP serveur (vpn_net et direct_net) ===
+pass in quick on { $vpn_if $dir_if } inet proto udp from any port 68 to port 67 keep state
+
+# === WAN inbound : tout bloquer SAUF wg2 inbound ===
+# IMPORTANT : pass UDP 51820 AVANT le block in
+pass in quick on $wan_if inet proto udp to ($wan_if) port $wg_in_port keep state
+block in quick on $wan_if
+
+# === Services internes (br-vpn, br-direct) ===
+pass in quick on $vpn_if inet proto tcp from $vpn_net    to ($vpn_if) port 22 keep state
+pass in quick on $dir_if inet proto tcp from $direct_net to ($dir_if) port 22 keep state
+
+pass in quick on $vpn_if inet proto { tcp udp } from $vpn_net    to ($vpn_if) port 53 keep state
+pass in quick on $dir_if inet proto { tcp udp } from $direct_net to ($dir_if) port 53 keep state
+
+pass in quick on $vpn_if inet proto icmp icmp-type echoreq keep state
+pass in quick on $dir_if inet proto icmp icmp-type echoreq keep state
+
+# === Tunnel WG inbound (wg2) ===
+# SSH vers le router via tunnel
+pass in quick on $wg_in inet proto tcp from $wg_in_net to ($wg_in) port 22 keep state
+
+# ICMP depuis tunnel
+pass in quick on $wg_in inet proto icmp from $wg_in_net icmp-type echoreq keep state
+
+# Forward depuis tunnel vers ressources internes
+pass in quick on $wg_in inet proto tcp from $wg_in_net to $void_ip port 22 keep state
+pass in quick on $wg_in inet proto tcp from $wg_in_net to $vpn_net    port 22 keep state
+pass in quick on $wg_in inet proto tcp from $wg_in_net to $direct_net port 22 keep state
+
+pass in quick on $wg_in inet proto icmp from $wg_in_net to { $vpn_net $direct_net $void_ip } keep state
+
+# === Sortie Internet pour les bridges ===
+pass in quick on $vpn_if inet from $vpn_net    keep state
+pass in quick on $dir_if inet from $direct_net keep state
+
+# === Isolation inter-bridges ===
+block drop quick on $vpn_if inet from $vpn_net    to $direct_net
+block drop quick on $dir_if inet from $direct_net to $vpn_net
+```
+
+Vérifier la syntaxe sans charger :
+
+```
+doas pfctl -nf /etc/pf.conf
+```
+
+Pas de sortie = OK. Charger :
+
+```
+doas pfctl -f /etc/pf.conf
+doas pfctl -si | grep Status
+doas pfctl -sr | grep 51820
+```
+
+Vérifier que la règle UDP 51820 est bien présente. Sortie attendue :
+
+```
+Status: Enabled for ...
+pass in quick on vio0 inet proto udp from any to (vio0) port = 51820
+```
+
+-----
+
+## G. DNAT côté Void via nftables (table dédiée)
+
+**Bug critique évité** : ne JAMAIS utiliser `flush ruleset` dans `/etc/nftables.conf`. Cela vide les chaînes `libvirt_network` et casse tous les bridges (br-wan, br-vpn, br-direct) jusqu’au reboot.
+
+**Bug critique de syntaxe** : en table `inet`, écrire `dnat ip to` (pas `dnat to`).
+
+Sur **voidhv** :
+
+```
+sudo xbps-install -y nftables
+sudo mkdir -p /etc/nftables.d
+```
+
+Créer `/etc/nftables.d/farmos_dnat.nft` :
+
+```
+sudo tee /etc/nftables.d/farmos_dnat.nft > /dev/null <<'EOF'
+#!/usr/sbin/nft -f
+# /etc/nftables.d/farmos_dnat.nft
+# DNAT WireGuard UDP/51820 entrant wlan0 → obsd-router 192.168.100.10
+# Coexistence stricte avec ip libvirt_network : on ne touche QUE notre table.
+
+# Idempotence : retire notre table si elle existe déjà, puis recrée
+destroy table inet farmos_dnat 2>/dev/null
+
+table inet farmos_dnat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+
+        iifname "wlan0" udp dport 51820 \
+            dnat ip to 192.168.100.10:51820 \
+            comment "wireguard farm-home -> obsd-router"
+    }
+
+    # Pas de chain postrouting / pas de masquerade.
+    # obsd-router a voidhv (192.168.100.1) comme default route → réponses OK.
+}
+EOF
+
+sudo chmod 644 /etc/nftables.d/farmos_dnat.nft
+```
+
+Charger :
+
+```
+sudo nft -f /etc/nftables.d/farmos_dnat.nft
+```
+
+Vérifier :
+
+```
+sudo nft list tables
+```
+
+Sortie attendue (les tables libvirt doivent toujours être là) :
+
+```
+table ip libvirt_network
+table ip6 libvirt_network
+table inet farmos_dnat
+```
+
+```
+sudo nft list table inet farmos_dnat
+```
+
+Doit afficher la chaîne prerouting avec la règle DNAT.
+
+### Conntrack UDP timeouts (optionnel)
+
+Les défauts kernel (UDP timeout 30s) sont compatibles avec un keepalive de 25s. Pour une marge de sécurité :
+
+```
+sudo tee /etc/sysctl.d/30-conntrack-wg.conf > /dev/null <<'EOF'
+net.netfilter.nf_conntrack_udp_timeout=60
+net.netfilter.nf_conntrack_udp_timeout_stream=180
+EOF
+
+sudo sysctl --system | grep nf_conntrack_udp
+```
+
+-----
+
+## H. Service runit nftables persistant
+
+**Bug critique évité** : un service runit dont le `run` exécute `nft -f` puis termine est relancé en boucle par `runsv`. Solution : pattern one-shot persistant = charger puis `exec sleep infinity`.
+
+Sur **voidhv** :
+
+```
+sudo mkdir -p /etc/sv/farmos-nft/log
+sudo mkdir -p /var/log/farmos-nft
+```
+
+Créer le run script :
+
+```
+sudo tee /etc/sv/farmos-nft/run > /dev/null <<'EOF'
+#!/bin/sh
+# /etc/sv/farmos-nft/run — pattern one-shot persistant
+exec 2>&1
+set -eu
+
+LOG="[farmos-nft]"
+RULES=/etc/nftables.d/farmos_dnat.nft
+
+echo "$LOG starting"
+
+# Attendre wlan0 et virbr-wan
+for i in 1 1 2 2 3 5 5 10 15 20 30; do
+    if ip link show wlan0 >/dev/null 2>&1 \
+       && ip link show virbr-wan >/dev/null 2>&1; then
+        echo "$LOG interfaces ready"
+        break
+    fi
+    echo "$LOG waiting interfaces ${i}s"
+    sleep "$i"
+done
+
+# Sanity check libvirt
+if ! nft list tables 2>/dev/null | grep -q 'ip libvirt_network'; then
+    echo "$LOG WARN: libvirt_network absent"
+fi
+
+echo "$LOG loading $RULES"
+nft -f "$RULES"
+
+nft list table inet farmos_dnat >/dev/null 2>&1 || {
+    echo "$LOG FATAL: table absente après load"
+    exit 1
+}
+
+echo "$LOG OK, idling"
+exec sleep infinity
+EOF
+
+sudo chmod +x /etc/sv/farmos-nft/run
+```
+
+Créer le finish script (cleanup au stop/restart) :
+
+```
+sudo tee /etc/sv/farmos-nft/finish > /dev/null <<'EOF'
+#!/bin/sh
+nft destroy table inet farmos_dnat 2>/dev/null || true
+exit 0
+EOF
+
+sudo chmod +x /etc/sv/farmos-nft/finish
+```
+
+Créer le log script :
+
+```
+sudo tee /etc/sv/farmos-nft/log/run > /dev/null <<'EOF'
+#!/bin/sh
+exec chpst -u _socklog svlogd -tt /var/log/farmos-nft
+EOF
+
+sudo chmod +x /etc/sv/farmos-nft/log/run
+sudo chown _socklog:_socklog /var/log/farmos-nft
+```
+
+Activer :
+
+```
+sudo ln -sf /etc/sv/farmos-nft /var/service/
+sleep 5
+sudo sv status farmos-nft
+```
+
+Sortie attendue :
+
+```
+run: farmos-nft: (pid XXXX) Ns; run: log: (pid YYYY) Ns
+```
+
+Vérifier les logs :
+
+```
+sudo tail -n 20 /var/log/farmos-nft/current
+```
+
+-----
+
+## I. Port forwarding sur Livebox Orange
+
+**Bug Livebox connu** : la Livebox associe parfois la règle au nom d’équipement plutôt qu’à l’IP. Si voidhv change de hostname, la règle pointe dans le vide. Solution : bail DHCP statique par MAC + sélection par IP.
+
+### Étape 1 — Bail DHCP statique pour voidhv
+
+Récupérer la MAC de wlan0 sur voidhv :
+
+```
+ip link show wlan0 | awk '/link\/ether/ {print $2}'
+```
+
+Sur la Livebox : `http://192.168.1.1` → mode avancé → **Réseau** → **DHCP** → **Baux DHCP statiques** :
+
+|Champ      |Valeur                                     |
+|-----------|-------------------------------------------|
+|MAC        |(sortie de la commande ci-dessus)          |
+|IP réservée|`192.168.1.42` (à adapter au plan IP local)|
+
+Forcer un renew DHCP sur voidhv :
+
+```
+sudo sv restart NetworkManager 2>/dev/null || sudo sv restart wpa_supplicant
+sleep 5
+ip -4 addr show wlan0
+```
+
+Doit afficher l’IP réservée.
+
+### Étape 2 — Redirection NAT/PAT
+
+Livebox → **Réseau** → **NAT/PAT** → ajouter :
+
+|Champ       |Valeur                                              |
+|------------|----------------------------------------------------|
+|Application |`WireGuard-farmos`                                  |
+|Protocole   |UDP                                                 |
+|Port externe|51820                                               |
+|Port interne|51820                                               |
+|Équipement  |sélectionner l’IP `192.168.1.42` (PAS le nom d’hôte)|
+|Activer     |✅                                                   |
+
+### Étape 3 — Pare-feu Livebox
+
+**Pare-feu** → niveau **Personnalisé** → ajouter règle “Autoriser UDP entrant 51820”.
+
+### Étape 4 — Test depuis l’extérieur
+
+Depuis un smartphone en 4G hors WiFi maison, installer un client UDP test (par exemple “PingTools” sur Android). Tester :
+
+- Cible : IP publique Livebox (visible via `curl -s https://checkipv4.dedyn.io` côté voidhv)
+- Port : 51820 UDP
+
+En parallèle sur voidhv :
+
+```
+sudo tcpdump -ni wlan0 'udp port 51820'
+```
+
+Doit voir un paquet entrant arriver.
+
+Sur obsd-router :
+
+```
+doas tcpdump -ni vio0 'udp port 51820'
+```
+
+Doit voir le paquet relayé par le DNAT Void.
+
+-----
+
+## J. DynDNS deSEC — service runit polling 600s sur Void
+
+Sur **voidhv** :
+
+```
+sudo mkdir -p /etc/desec
+sudo chmod 700 /etc/desec
+```
+
+Stocker le token (créé en section C) :
+
+```
+echo -n "<DYN_TOKEN-de-section-C>" | sudo tee /etc/desec/dyndns.token > /dev/null
+sudo chmod 600 /etc/desec/dyndns.token
+```
+
+Créer le script de mise à jour :
+
+```
+sudo tee /usr/local/bin/desec-update.sh > /dev/null <<'EOF'
+#!/bin/sh
+# /usr/local/bin/desec-update.sh
+set -eu
+
+FQDN=farmos.dedyn.io
+TOKEN=$(cat /etc/desec/dyndns.token)
+
+V4=$(curl -fsS --max-time 10 https://checkipv4.dedyn.io || true)
+V6=$(curl -fsS --max-time 10 https://checkipv6.dedyn.io || true)
+
+ARGS="hostname=${FQDN}"
+if [ -n "${V4:-}" ]; then ARGS="${ARGS}&myipv4=${V4}"; else ARGS="${ARGS}&myipv4=preserve"; fi
+if [ -n "${V6:-}" ]; then ARGS="${ARGS}&myipv6=${V6}"; else ARGS="${ARGS}&myipv6=preserve"; fi
+
+logger -t desec-update "PUT ${FQDN} v4=${V4:-?} v6=${V6:-?}"
+curl -fsS "https://update.dedyn.io/?${ARGS}" \
+  -H "Authorization: Token ${TOKEN}" \
+  -o /tmp/desec-update.last
+EOF
+
+sudo chmod +x /usr/local/bin/desec-update.sh
+```
+
+Test manuel :
+
+```
+sudo /usr/local/bin/desec-update.sh
+cat /tmp/desec-update.last
+```
+
+Service runit :
+
+```
+sudo mkdir -p /etc/sv/desec-update/log
+sudo mkdir -p /var/log/desec-update
+sudo chown _socklog:_socklog /var/log/desec-update
+
+sudo tee /etc/sv/desec-update/run > /dev/null <<'EOF'
+#!/bin/sh
+exec 2>&1
+while :; do
+    /usr/local/bin/desec-update.sh || echo "[desec-update] curl failed"
+    sleep 600
+done
+EOF
+
+sudo chmod +x /etc/sv/desec-update/run
+
+sudo tee /etc/sv/desec-update/log/run > /dev/null <<'EOF'
+#!/bin/sh
+exec chpst -u _socklog svlogd -tt /var/log/desec-update
+EOF
+
+sudo chmod +x /etc/sv/desec-update/log/run
+
+sudo ln -sf /etc/sv/desec-update /var/service/
+sleep 12
+sudo sv status desec-update
+```
+
+Vérifier la résolution DNS :
+
+```
+dig +short A   farmos.dedyn.io
+dig +short AAAA farmos.dedyn.io
+```
+
+Doit retourner l’IPv4 publique de la Livebox.
+
+-----
+
+## K. Installation et durcissement sshd sur Void
+
+**Bug race condition** : sshd peut tenter de bind sur 192.168.100.1 avant que `virbr-wan` soit créé par libvirt. Solution : run script avec polling.
+
+Sur **voidhv** :
+
+```
+sudo xbps-install -y openssh
+sudo ssh-keygen -A
+```
+
+Configuration `/etc/ssh/sshd_config` (durcie) :
+
+```
+sudo tee /etc/ssh/sshd_config > /dev/null <<'EOF'
+# /etc/ssh/sshd_config — voidhv homelab
+Port 22
+AddressFamily inet
+ListenAddress 192.168.100.1
+
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+AllowUsers radius
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 60
+ClientAliveCountMax 3
+
+# Algos modernes (post-quantique si OpenSSH 10.x)
+KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+HostKeyAlgorithms ssh-ed25519
+PubkeyAcceptedAlgorithms ssh-ed25519,sk-ssh-ed25519@openssh.com
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+AllowAgentForwarding no
+AllowTcpForwarding yes
+X11Forwarding no
+PrintMotd no
+Subsystem sftp internal-sftp
+EOF
+```
+
+Supprimer les host keys non-ed25519 :
+
+```
+sudo rm -f /etc/ssh/ssh_host_rsa_key* /etc/ssh/ssh_host_ecdsa_key* /etc/ssh/ssh_host_dsa_key*
+sudo ssh-keygen -A
+```
+
+Patcher le service runit sshd pour gérer la race :
+
+```
+sudo tee /etc/sv/sshd/run > /dev/null <<'EOF'
+#!/bin/sh
+# /etc/sv/sshd/run — patch race avec virbr-wan
+exec 2>&1
+set -eu
+
+# Attendre que 192.168.100.1 soit prête sur virbr-wan
+for i in 1 1 2 2 3 5 5 10 15 20 30 45 60; do
+    if ip -4 addr show virbr-wan 2>/dev/null | grep -q '192.168.100.1'; then
+        echo "[sshd] virbr-wan ready"
+        break
+    fi
+    echo "[sshd] waiting virbr-wan ${i}s"
+    sleep "$i"
+done
+
+[ -d /run/sshd ] || mkdir -p /run/sshd
+exec /usr/sbin/sshd -D -e
+EOF
+
+sudo chmod +x /etc/sv/sshd/run
+```
+
+Déposer la clé publique du Pi sur Void (récupérée plus tard, en attendant on prépare l’arbo) :
+
+```
+sudo mkdir -p /home/radius/.ssh
+sudo chmod 700 /home/radius/.ssh
+sudo touch /home/radius/.ssh/authorized_keys
+sudo chmod 600 /home/radius/.ssh/authorized_keys
+sudo chown -R radius:radius /home/radius/.ssh
+```
+
+Activer le service :
+
+```
+sudo ln -sf /etc/sv/sshd /var/service/
+sleep 5
+sudo sv status sshd
+sudo ss -tlnp | grep ':22'
+```
+
+Sortie attendue : un seul listener `192.168.100.1:22`. PAS `0.0.0.0:22` ni `[::]:22`.
+
+Test depuis obsd-router (qui a accès à 192.168.100.1) :
+
+```
+ssh radius@192.168.100.1
+```
+
+-----
+
+## L. Configuration sshd sur obsd-router
+
+sshd doit écouter sur `10.99.0.1` (wg2, peers distants) ET `10.0.10.1` (vio1, atelier). PAS sur `vio0` (jamais exposé WAN).
+
+Sur **obsd-router** :
+
+```
+doas vim /etc/ssh/sshd_config
+```
+
+Régler ces lignes (ajouter ou modifier) :
+
+```
+ListenAddress 10.99.0.1
+ListenAddress 10.0.10.1
+AddressFamily inet
+
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowUsers radius
+MaxAuthTries 3
+ClientAliveInterval 60
+ClientAliveCountMax 3
+
+KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com
+HostKeyAlgorithms ssh-ed25519
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+AllowAgentForwarding no
+AllowTcpForwarding yes
+X11Forwarding no
+```
+
+Recharger sshd :
+
+```
+doas rcctl restart sshd
+doas rcctl check sshd
+```
+
+Vérifier les listeners :
+
+```
+doas netstat -an -f inet | grep '\.22 '
+```
+
+Doit afficher uniquement `10.99.0.1.22` et `10.0.10.1.22`.
+
+### Application des errata 7.8
+
+Critique avant exposition WAN :
+
+```
+doas syspatch -c
+doas syspatch
+```
+
+Notamment **#025 (kernel crash sur SACK TCP malformé)** et **#003 (cache poisoning unbound)**.
+
+-----
+
+## M. Configuration `~/.ssh/config` sur l’atelier
+
+Sur **atelier** (terminal XFCE) :
+
+```
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+cat > ~/.ssh/config <<'EOF'
+Host obsd-router
+    HostName 10.0.10.1
+    User radius
+    IdentityFile ~/.ssh/farm_os_admin
+    IdentitiesOnly yes
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+    ForwardAgent no
+
+Host voidhv
+    HostName 192.168.100.1
+    User radius
+    ProxyJump obsd-router
+    IdentityFile ~/.ssh/farm_os_admin
+    IdentitiesOnly yes
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+    ForwardAgent no
+EOF
+
+chmod 600 ~/.ssh/config
+```
+
+**Note `ForwardAgent no`** : ne jamais forwarder l’agent SSH vers un bastion. Un bastion compromis pourrait alors se connecter à toutes tes autres machines.
+
+**Note `ControlMaster auto`** : sans cela, chaque commande SSH paie le coût d’un nouveau handshake (~1s sur LAN, 2-5s à distance). Avec multiplexing, les connexions suivantes sont quasi-instantanées.
+
+Test :
+
+```
+ssh obsd-router 'ifconfig wg2 | head'
+ssh voidhv 'sv status farmos-nft'
+```
+
+-----
+
+## N. Configuration côté Pi (peer WG inbound)
+
+Sur le **Pi**, installer et configurer.
+
+### Génération clé SSH
+
+```
+ssh-keygen -t ed25519 -a 100 -f ~/.ssh/id_ed25519 -C "radius@rpi5-banc-test"
+cat ~/.ssh/id_ed25519.pub
+```
+
+Noter cette pubkey, elle ira dans `authorized_keys` côté obsd-router et voidhv.
+
+Sur **obsd-router** :
+
+```
+echo '<contenu-id_ed25519.pub-du-Pi>' | doas tee -a /home/radius/.ssh/authorized_keys
+doas chmod 600 /home/radius/.ssh/authorized_keys
+doas chown radius:radius /home/radius/.ssh/authorized_keys
+```
+
+Sur **voidhv** :
+
+```
+echo '<contenu-id_ed25519.pub-du-Pi>' | sudo tee -a /home/radius/.ssh/authorized_keys
+```
+
+### Configuration `~/.ssh/config` sur le Pi
+
+```
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+
+cat > ~/.ssh/config <<'EOF'
+Host obsd-router
+    HostName 10.99.0.1
+    User radius
+    IdentityFile ~/.ssh/id_ed25519
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+    ForwardAgent no
+
+Host voidhv
+    HostName 192.168.100.1
+    User radius
+    ProxyJump obsd-router
+    IdentityFile ~/.ssh/id_ed25519
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+    ForwardAgent no
+
+Host atelier
+    HostName 10.0.10.50
+    User radius
+    ProxyJump obsd-router
+    IdentityFile ~/.ssh/id_ed25519
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+    ForwardAgent no
+EOF
+
+chmod 600 ~/.ssh/config
+```
+
+### Configuration WireGuard farm-home
+
+Installer WireGuard :
+
+```
+sudo apt-get install -y wireguard wireguard-tools
+```
+
+Récupérer les valeurs depuis obsd-router (clé publique serveur + PSK, transmis par canal sécurisé) et créer `/etc/wireguard/farm-home.conf` :
+
+```
+sudo tee /etc/wireguard/farm-home.conf > /dev/null <<EOF
+[Interface]
+Address    = 10.99.0.42/32
+PrivateKey = $(sudo cat /etc/wireguard/farm-home.key)
+MTU        = 1380
+Table      = off
+
+PostUp   = ip route add 10.99.0.0/24 dev %i
+PostDown = ip route del 10.99.0.0/24 dev %i 2>/dev/null || true
+
+[Peer]
+PublicKey           = <coller-ici-wg2_server.pub-de-obsd-router>
+PresharedKey        = <coller-ici-wg2_pi.psk-de-obsd-router>
+AllowedIPs          = 10.99.0.0/24
+Endpoint            = farmos.dedyn.io:51820
+PersistentKeepalive = 25
+EOF
+
+sudo chmod 600 /etc/wireguard/farm-home.conf
+```
+
+**Note `Table = off`** : on ne crée PAS de full-tunnel. Seules les routes vers `10.99.0.0/24` passent par wg, le reste du trafic Pi sort en clair.
+
+Activer le tunnel :
+
+```
+sudo systemctl enable --now wg-quick@farm-home
+sudo wg show farm-home
+```
+
+Sortie attendue après quelques secondes :
+
+```
+interface: farm-home
+  public key: <pi-pub>
+  listening port: <random>
+
+peer: <serveur-pub>
+  preshared key: (hidden)
+  endpoint: <ipv4-livebox>:51820
+  allowed ips: 10.99.0.0/24
+  latest handshake: 5 seconds ago
+  transfer: 1.20 KiB received, 2.40 KiB sent
+  persistent keepalive: every 25 seconds
+```
+
+Test ping :
+
+```
+ping -c 4 -M do -s 1352 10.99.0.1
+```
+
+(1352 + 28 octets header = 1380 → pas de fragmentation).
+
+Test SSH ProxyJump :
+
+```
+ssh obsd-router 'hostname'
+ssh voidhv 'hostname'
+ssh atelier 'hostname'
+```
+
+-----
+
+## O. Test virt-manager remote depuis le Pi
+
+Sur le **Pi** :
+
+```
+sudo apt-get install -y virt-manager openssh-client
+```
+
+Vérifier que les VMs ont SPICE bindé sur 127.0.0.1 (sinon le tunnel SSH ne peut pas relayer la console).
+
+Sur **voidhv** :
+
+```
+for VM in router atelier; do
+    sudo virsh dumpxml "$VM" | grep -A2 '<graphics'
+done
+```
+
+Si une VM montre `address='0.0.0.0'`, corriger :
+
+```
+sudo virsh edit <vm>
+```
+
+Remplacer le bloc `<graphics>` par :
+
+```
+<graphics type='spice' autoport='yes'>
+    <listen type='address' address='127.0.0.1'/>
+</graphics>
+```
+
+Redémarrer la VM (shutdown propre + start).
+
+Sur le **Pi**, avec le tunnel WG actif :
+
+```
+virt-manager -c "qemu+ssh://voidhv/system"
+```
+
+virt-manager utilise OpenSSH système, qui suit `~/.ssh/config` et applique le ProxyJump automatiquement. La fenêtre doit afficher les VMs `router` et `atelier`. Double-clic sur `atelier` → la console SPICE s’ouvre, tunnélisée à travers la chaîne.
+
+Validation CLI parallèle :
+
+```
+virsh -c qemu+ssh://voidhv/system list --all
+```
+
+-----
+
+## P. Snapshots
+
+Une fois tout vérifié end-to-end :
+
+```
+sudo virsh shutdown router
+sleep 30
+sudo virsh shutdown atelier
+sleep 30
+sudo virsh list --all
+
+sudo virsh snapshot-create-as router phase06 \
+    "WG inbound wg2 + sshd durci + errata 7.8"
+sudo virsh snapshot-create-as atelier phase06 \
+    "ssh config ProxyJump + ControlMaster"
+
+sudo virsh snapshot-list router
+sudo virsh snapshot-list atelier
+```
+
+Pour voidhv (pas de snapshot natif), backup des fichiers critiques :
+
+```
+sudo tar czf /root/farmos-phase06-voidhv.tar.gz \
+    /etc/nftables.d/farmos_dnat.nft \
+    /etc/sv/farmos-nft \
+    /etc/sv/desec-update \
+    /etc/sv/sshd/run \
+    /etc/ssh/sshd_config \
+    /etc/desec/dyndns.token \
+    /usr/local/bin/desec-update.sh
+
+sudo chmod 600 /root/farmos-phase06-voidhv.tar.gz
+```
+
+Le tarball contient le token deSEC, le copier sur clé USB chiffrée (LUKS).
+
+-----
+
+## Q. Vérifications finales phase 06
+
+À cocher dans l’ordre :
+
+```
+# Sur l'atelier
+curl -s https://checkipv4.dedyn.io   # IP publique Livebox, pas 100.64.x.x
+dig +short A farmos.dedyn.io          # même IP
+
+# Sur voidhv
+sudo nft list tables                  # ip libvirt_network ET inet farmos_dnat
+sudo sv status farmos-nft desec-update sshd libvirtd
+sudo ss -tlnp | grep ':22'            # uniquement 192.168.100.1:22
+
+# Sur obsd-router
+ifconfig wg2 | head                   # UP, inet 10.99.0.1, wgpeer
+doas pfctl -sr | grep 51820           # règle pass UDP 51820 présente
+doas wg show wg0                      # tunnel Mullvad toujours up
+doas syspatch -c                      # errata appliqués
+
+# Sur le Pi (tunnel WG actif)
+sudo wg show farm-home | grep handshake     # < 2 min
+ping -M do -s 1352 -c 2 10.99.0.1           # pas de fragmentation
+ssh voidhv hostname                          # via ProxyJump
+ssh atelier hostname                         # via ProxyJump
+virt-manager -c qemu+ssh://voidhv/system    # GUI s'ouvre
+
+# Sur voidhv
+sudo virsh snapshot-list router | grep phase06
+sudo virsh snapshot-list atelier | grep phase06
+```
+
+-----
+
+## Troubleshooting
+
+### Tunnel WG ne s’établit pas (pas de handshake)
+
+Causes par ordre de probabilité :
+
+1. **CGNAT toujours actif** : `curl https://checkipv4.dedyn.io` côté voidhv ≠ IP WAN Livebox → retour B
+1. **DynDNS pas à jour** : `dig +short A farmos.dedyn.io` doit retourner l’IPv4 publique courante. Sinon : `sudo sv restart desec-update` puis attendre 30s
+1. **Port forward Livebox manquant** : tcpdump sur voidhv wlan0 ne voit rien → règle NAT/PAT à refaire en sélectionnant l’IP (pas le nom), pare-feu en Personnalisé
+1. **DNAT nftables manquant** : `sudo nft list table inet farmos_dnat` doit montrer la chaîne. Sinon : `sudo sv restart farmos-nft`, vérifier `/var/log/farmos-nft/current`
+1. **pf bloque** : sur obsd-router, `doas tcpdump -ni vio0 'udp port 51820'` doit voir l’arrivée. Si paquet visible mais pas de réponse → ordre des règles pf, vérifier que `pass in quick on vio0 ... port 51820` est AVANT `block in quick on vio0`
+1. **MTU trop élevé** : descendre MTU = 1280 côté Pi (`sudo wg-quick down farm-home && sudo wg-quick up farm-home`)
+1. **Mauvaise PSK ou pubkey** : `doas dmesg | grep -i wg` sur obsd-router → `Invalid initiation MAC` confirme
+
+### DNAT Void ne fonctionne pas
+
+- `nft list ruleset | grep libvirt_network` retourne vide → un `flush ruleset` accidentel a tué libvirt. Récupération : `sudo virsh net-destroy <reseau> && sudo virsh net-start <reseau>` pour chaque réseau (wan, vpn, direct, default). Si insuffisant : reboot.
+- Erreur `specify dnat ip or dnat ip6 in inet table` lors du `nft -f` → vérifier que la règle utilise `dnat ip to` (pas `dnat to`)
+- `iifname "wlan0"` ne matche pas → vérifier le nom exact : `ip link show` (peut être `wlp2s0`)
+
+### libvirt en panne après manipulation nftables
+
+Symptôme : `nft list tables` est vide ou les VMs n’ont plus de réseau.
+
+```
+sudo virsh net-list --all
+for net in wan vpn direct default; do
+    sudo virsh net-destroy "$net" 2>/dev/null
+    sudo virsh net-start  "$net"
+done
+sudo nft list tables    # libvirt_network doit revenir
+```
+
+Si insuffisant, reboot voidhv.
+
+### Ports virtio en state DOWN après reboot voidhv
+
+Symptôme post-reboot : `ip link show` montre `vnet4`, `vnet6` etc. en state DOWN, VMs sans réseau.
+
+Workaround manuel :
+
+```
+for v in $(ip -o link show | awk -F': ' '/vnet/{print $2}'); do
+    sudo ip link set "$v" up
+done
+```
+
+Bug d’origine probable : timing libvirt vs qemu au boot Void runit.
+
+### sshd voidhv en boucle de redémarrage
+
+Symptôme : `sv status sshd` flappe, journal `bind: Cannot assign requested address`.
+
+Cause : `ListenAddress 192.168.100.1` mais `virbr-wan` pas encore créé par libvirt.
+
+Fix : run script avec polling (cf. K). Si déjà en place et toujours en boucle : augmenter le délai dans la boucle, vérifier que libvirtd démarre bien avant sshd.
+
+### virt-manager se connecte mais consoles ne s’ouvrent pas
+
+Symptôme : la liste des VMs s’affiche, mais double-clic donne “Unable to connect to graphical console”.
+
+Cause : SPICE bindé sur 0.0.0.0, le tunnel SSH ne peut pas attraper le port distant à travers le ProxyJump.
+
+Fix : `virsh edit <vm>` → mettre `<listen type='address' address='127.0.0.1'/>`. Redémarrer la VM.
+
+### DynDNS update échoue
+
+Symptôme : `dig` retourne une vieille IP, `/var/log/desec-update/current` montre erreur.
+
+- `401` : token invalide ou révoqué → régénérer via frontend, mettre à jour `/etc/desec/dyndns.token`
+- `403` : policy manquante → re-attacher policies A/AAAA (cf. C)
+- `28` : timeout → `update.dedyn.io` injoignable, vérifier connectivité sortante voidhv
+- Aucun log : service runit pas démarré → `sudo sv up desec-update`
+
+### Latence élevée via ProxyJump
+
+Symptôme : `ssh voidhv hostname` prend 3-5s à chaque appel.
+
+Fix : vérifier que `ControlMaster auto` + `ControlPath` + `ControlPersist 10m` sont bien dans `~/.ssh/config`. Première connexion paie le coût, suivantes < 100ms.
+
+```
+ls -la ~/.ssh/cm-*    # voir les masters actives
+ssh -O exit voidhv    # forcer fermeture
+```
+
+### Route /32 endpoint Mullvad perdue après destroy/recreate wg0
+
+Symptôme phase 05 : après `ifconfig wg0 destroy && sh /etc/netstart wg0`, le tunnel ne se réétablit pas.
+
+Cause : la route /32 vers l’endpoint Mullvad est une route utilisateur (déclarée par `!route add` dans hostname.wg0). Quand wg0 est détruit, les routes scopées disparaissent.
+
+Fix manuel :
+
+```
+doas route add -inet <ENDPOINT_MULLVAD>/32 192.168.100.1
+```
+
+Préférer toujours `sh /etc/netstart wg0` plutôt que des manipulations manuelles.
+
+-----
+
+## État attendu en fin de phase 06
+
+- Tunnel WG inbound `wg2` UP sur obsd-router avec un peer `rpi5-banc-test`
+- Pi peut établir le tunnel depuis le LAN domestique (NAT loopback Livebox) ou la 4G
+- SSH ProxyJump fonctionnel : Pi → obsd-router → voidhv (et vers atelier)
+- virt-manager remote depuis le Pi affiche les VMs et ouvre les consoles SPICE
+- Tunnel sortant Mullvad multihop NO→SE toujours fonctionnel (aucune régression)
+- DynDNS deSEC met à jour `farmos.dedyn.io` toutes les 10 min
+- sshd voidhv écoute uniquement sur `192.168.100.1:22`
+- sshd obsd-router écoute uniquement sur `10.99.0.1:22` et `10.0.10.1:22`
+- Tables nftables : `ip libvirt_network` ET `inet farmos_dnat` cohabitent, aucun `flush ruleset`
+- Errata OpenBSD 7.8 appliqués
+- Snapshots `phase06` créés pour router et atelier
+- Token deSEC stocké dans `/etc/desec/dyndns.token` (mode 600)
+- Aucune PrivateKey n’a quitté la machine où elle a été générée
+
+Le second peer (mobile/laptop nomade) sera ajouté en phase 06bis avec une seconde `wgpeer` dans `/etc/hostname.wg2`. Le hidden service Tor v3 reste reporté en phase 06ter optionnelle. La phase 07 (Mullvad Paris pour wg1) peut commencer.
