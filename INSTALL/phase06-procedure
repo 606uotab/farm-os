@@ -1,6 +1,6 @@
 # Phase 06 — Accès distant : WireGuard inbound + SSH + virt-manager remote
 
-**Objectif** : pouvoir piloter le homelab depuis n’importe où. Une interface WireGuard inbound `wg2` sur obsd-router accepte les connexions extérieures (un seul port UDP exposé). Une fois dans le tunnel, SSH vers OpenBSD + ProxyJump vers Void + virt-manager qemu+ssh donne un accès graphique complet à toutes les VMs. SSH sur Void est durci et ne binde que sur l’IP interne. DynDNS deSEC pour résoudre l’IP publique dynamique de la Livebox.
+**Objectif*** : pouvoir piloter le homelab depuis n’importe où. Une interface WireGuard inbound `wg2` sur obsd-router accepte les connexions extérieures (un seul port UDP exposé). Une fois dans le tunnel, SSH vers OpenBSD + ProxyJump vers Void + virt-manager qemu+ssh donne un accès graphique complet à toutes les VMs. SSH sur Void est durci et ne binde que sur l’IP interne. DynDNS deSEC pour résoudre l’IP publique dynamique de la Livebox.
 
 **Durée estimée** : 3-4 h (sans compter la désactivation CGNAT Orange qui peut prendre plusieurs jours selon le support)
 
